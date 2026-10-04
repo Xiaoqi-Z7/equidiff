@@ -98,7 +98,8 @@ Use the same EquiDiff runner settings for all methods:
 - 6 train initializations and 50 test seeds;
 - test seeds starting at 100000;
 - 28 environment workers;
-- `To=2`, `Ta=8`, and 400 environment steps;
+- the checkpoint's observation/action horizons and EquiDiff's task-specific
+  episode limit (400, 500, 800, or 1000 steps);
 - absolute OSC control;
 - policy sampling seed and number of repeated evaluation runs.
 

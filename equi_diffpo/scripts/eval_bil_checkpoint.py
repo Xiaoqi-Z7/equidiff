@@ -17,6 +17,22 @@ from equi_diffpo.env_runner.robomimic_image_runner import RobomimicImageRunner
 from equi_diffpo.policy.bil_checkpoint_policy import BILCheckpointPolicy
 
 
+MIMICGEN_MAX_STEPS = {
+    "Stack_D1": 400,
+    "StackThree_D1": 400,
+    "Square_D2": 400,
+    "Threading_D2": 400,
+    "Coffee_D2": 400,
+    "ThreePieceAssembly_D2": 500,
+    "HammerCleanup_D1": 500,
+    "MugCleanup_D1": 500,
+    "Kitchen_D1": 800,
+    "NutAssembly_D0": 500,
+    "PickPlace_D0": 1000,
+    "CoffeePreparation_D1": 800,
+}
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint", required=True)
@@ -31,15 +47,21 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--seed", type=int, default=0, help="Policy sampling seed")
     parser.add_argument("--n-train", type=int, default=6)
-    parser.add_argument("--n-train-vis", type=int, default=0)
+    parser.add_argument("--n-train-vis", type=int, default=2)
     parser.add_argument("--train-start-idx", type=int, default=0)
     parser.add_argument("--n-test", type=int, default=50)
-    parser.add_argument("--n-test-vis", type=int, default=0)
+    parser.add_argument("--n-test-vis", type=int, default=4)
     parser.add_argument("--test-start-seed", type=int, default=100000)
     parser.add_argument("--n-envs", type=int, default=28)
-    parser.add_argument("--max-steps", type=int, default=400)
+    parser.add_argument(
+        "--max-steps",
+        type=int,
+        default=None,
+        help="Override EquiDiff's task-specific horizon.",
+    )
     parser.add_argument("--fps", type=int, default=10)
     parser.add_argument("--crf", type=int, default=22)
+    parser.add_argument("--tqdm-interval-sec", type=float, default=1.0)
     return parser
 
 
@@ -63,6 +85,15 @@ def main() -> None:
         raise ValueError(
             f"Checkpoint task is {policy.task_name!r}, but --task is {args.task!r}"
         )
+    max_steps = args.max_steps
+    if max_steps is None:
+        try:
+            max_steps = MIMICGEN_MAX_STEPS[task_name]
+        except KeyError as error:
+            raise ValueError(
+                f"No EquiDiff max_steps mapping for task {task_name!r}; "
+                "pass --max-steps explicitly"
+            ) from error
 
     print(
         json.dumps(
@@ -80,6 +111,7 @@ def main() -> None:
                 "n_envs": args.n_envs,
                 "n_test": args.n_test,
                 "test_start_seed": args.test_start_seed,
+                "max_steps": max_steps,
             },
             indent=2,
         )
@@ -97,13 +129,14 @@ def main() -> None:
             n_test=args.n_test,
             n_test_vis=args.n_test_vis,
             test_start_seed=args.test_start_seed,
-            max_steps=args.max_steps,
+            max_steps=max_steps,
             n_obs_steps=policy.observation_horizon,
             n_action_steps=policy.action_horizon,
             fps=args.fps,
             crf=args.crf,
             n_envs=args.n_envs,
             abs_action=True,
+            tqdm_interval_sec=args.tqdm_interval_sec,
             wrapper_factory=BILMimicGenWrapper,
         )
         log_data = runner.run(policy)
