@@ -1,10 +1,14 @@
-from typing import List, Optional
+from typing import TYPE_CHECKING, Any, List, Optional
 from matplotlib.pyplot import fill
 import numpy as np
 import gym
 from gym import spaces
 from omegaconf import OmegaConf
-from robomimic.envs.env_robosuite import EnvRobosuite
+
+if TYPE_CHECKING:
+    from robomimic.envs.env_robosuite import EnvRobosuite
+else:
+    EnvRobosuite = Any
 
 class RobomimicImageWrapper(gym.Env):
     def __init__(self, 

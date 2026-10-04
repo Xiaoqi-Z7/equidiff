@@ -1,0 +1,128 @@
+"""Evaluate a BIL checkpoint in EquiDiff's vectorized MimicGen pipeline."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import random
+from pathlib import Path
+
+import numpy as np
+import torch
+
+from equi_diffpo.env.robomimic.bil_mimicgen_wrapper import (
+    BILMimicGenWrapper,
+)
+from equi_diffpo.env_runner.robomimic_image_runner import RobomimicImageRunner
+from equi_diffpo.policy.bil_checkpoint_policy import BILCheckpointPolicy
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--checkpoint", required=True)
+    parser.add_argument("--dataset", required=True)
+    parser.add_argument("--output-dir", required=True)
+    parser.add_argument(
+        "--task",
+        default=None,
+        help="MimicGen task name (for example Square_D2); inferred when possible.",
+    )
+    parser.add_argument("--task-description", default=None)
+    parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--seed", type=int, default=0, help="Policy sampling seed")
+    parser.add_argument("--n-train", type=int, default=6)
+    parser.add_argument("--n-train-vis", type=int, default=0)
+    parser.add_argument("--train-start-idx", type=int, default=0)
+    parser.add_argument("--n-test", type=int, default=50)
+    parser.add_argument("--n-test-vis", type=int, default=0)
+    parser.add_argument("--test-start-seed", type=int, default=100000)
+    parser.add_argument("--n-envs", type=int, default=28)
+    parser.add_argument("--max-steps", type=int, default=400)
+    parser.add_argument("--fps", type=int, default=10)
+    parser.add_argument("--crf", type=int, default=22)
+    return parser
+
+
+def main() -> None:
+    args = build_parser().parse_args()
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
+
+    policy = BILCheckpointPolicy(
+        checkpoint_path=args.checkpoint,
+        device=args.device,
+        task_description=args.task_description,
+    )
+    task_name = args.task or policy.task_name
+    if task_name is None:
+        raise ValueError("Could not infer task from checkpoint; pass --task")
+    if args.task is not None and policy.task_name not in (None, args.task):
+        raise ValueError(
+            f"Checkpoint task is {policy.task_name!r}, but --task is {args.task!r}"
+        )
+
+    print(
+        json.dumps(
+            {
+                "checkpoint": policy.checkpoint_path,
+                "runner": (
+                    "equi_diffpo.env_runner.robomimic_image_runner."
+                    "RobomimicImageRunner"
+                ),
+                "task": task_name,
+                "device": str(policy.device),
+                "To": policy.observation_horizon,
+                "Ta": policy.action_horizon,
+                "Tp": policy.prediction_horizon,
+                "n_envs": args.n_envs,
+                "n_test": args.n_test,
+                "test_start_seed": args.test_start_seed,
+            },
+            indent=2,
+        )
+    )
+
+    runner = None
+    try:
+        runner = RobomimicImageRunner(
+            output_dir=args.output_dir,
+            dataset_path=args.dataset,
+            shape_meta=policy.shape_meta,
+            n_train=args.n_train,
+            n_train_vis=args.n_train_vis,
+            train_start_idx=args.train_start_idx,
+            n_test=args.n_test,
+            n_test_vis=args.n_test_vis,
+            test_start_seed=args.test_start_seed,
+            max_steps=args.max_steps,
+            n_obs_steps=policy.observation_horizon,
+            n_action_steps=policy.action_horizon,
+            fps=args.fps,
+            crf=args.crf,
+            n_envs=args.n_envs,
+            abs_action=True,
+            wrapper_factory=BILMimicGenWrapper,
+        )
+        log_data = runner.run(policy)
+        metrics = {
+            key: float(value)
+            for key, value in log_data.items()
+            if isinstance(value, (int, float, np.integer, np.floating))
+        }
+        metrics_path = Path(args.output_dir).expanduser().resolve() / "metrics.json"
+        metrics_path.parent.mkdir(parents=True, exist_ok=True)
+        metrics_path.write_text(
+            json.dumps(metrics, indent=2, sort_keys=True) + "\n"
+        )
+        print(json.dumps(metrics, indent=2, sort_keys=True))
+        print(f"metrics_path={metrics_path}")
+    finally:
+        if runner is not None:
+            runner.env.close()
+
+
+if __name__ == "__main__":
+    main()

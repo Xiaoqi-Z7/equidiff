@@ -19,6 +19,10 @@ from equi_diffpo.policy.base_image_policy import BaseImagePolicy
 from equi_diffpo.common.pytorch_util import dict_apply
 from equi_diffpo.env_runner.base_image_runner import BaseImageRunner
 from equi_diffpo.env.robomimic.robomimic_image_wrapper import RobomimicImageWrapper
+from equi_diffpo.common.mujoco_py_compat import install_mujoco_py_exception_shim
+
+install_mujoco_py_exception_shim()
+
 import robomimic.utils.file_utils as FileUtils
 import robomimic.utils.env_utils as EnvUtils
 import robomimic.utils.obs_utils as ObsUtils
@@ -63,12 +67,16 @@ class RobomimicImageRunner(BaseImageRunner):
             past_action=False,
             abs_action=False,
             tqdm_interval_sec=5.0,
-            n_envs=None
+            n_envs=None,
+            env_factory=None,
+            wrapper_factory=None,
         ):
         super().__init__(output_dir)
 
         if n_envs is None:
             n_envs = n_train + n_test
+        if wrapper_factory is None:
+            wrapper_factory = RobomimicImageWrapper
 
         # assert n_obs_steps <= n_action_steps
         dataset_path = os.path.expanduser(dataset_path)
@@ -87,17 +95,20 @@ class RobomimicImageRunner(BaseImageRunner):
             rotation_transformer = RotationTransformer('axis_angle', 'rotation_6d')
 
         def env_fn():
-            robomimic_env = create_env(
-                env_meta=env_meta, 
-                shape_meta=shape_meta
-            )
+            if env_factory is None:
+                robomimic_env = create_env(
+                    env_meta=env_meta,
+                    shape_meta=shape_meta,
+                )
+            else:
+                robomimic_env = env_factory(enable_render=True)
             # Robosuite's hard reset causes excessive memory consumption.
             # Disabled to run more envs.
             # https://github.com/ARISE-Initiative/robosuite/blob/92abf5595eddb3a845cd1093703e5a3ccd01e77e/robosuite/environments/base.py#L247-L248
             robomimic_env.env.hard_reset = False
             return MultiStepWrapper(
                 VideoRecordingWrapper(
-                    RobomimicImageWrapper(
+                    wrapper_factory(
                         env=robomimic_env,
                         shape_meta=shape_meta,
                         init_state=None,
@@ -124,14 +135,17 @@ class RobomimicImageRunner(BaseImageRunner):
         # a separate env_fn that does not create OpenGL context (enable_render=False)
         # is needed to initialize spaces.
         def dummy_env_fn():
-            robomimic_env = create_env(
-                    env_meta=env_meta, 
+            if env_factory is None:
+                robomimic_env = create_env(
+                    env_meta=env_meta,
                     shape_meta=shape_meta,
-                    enable_render=False
+                    enable_render=False,
                 )
+            else:
+                robomimic_env = env_factory(enable_render=False)
             return MultiStepWrapper(
                 VideoRecordingWrapper(
-                    RobomimicImageWrapper(
+                    wrapper_factory(
                         env=robomimic_env,
                         shape_meta=shape_meta,
                         init_state=None,
@@ -180,7 +194,7 @@ class RobomimicImageRunner(BaseImageRunner):
                         env.env.file_path = filename
 
                     # switch to init_state reset
-                    assert isinstance(env.env.env, RobomimicImageWrapper)
+                    assert isinstance(env.env.env, wrapper_factory)
                     env.env.env.init_state = init_state
 
                 env_seeds.append(train_idx)
@@ -207,7 +221,7 @@ class RobomimicImageRunner(BaseImageRunner):
                     env.env.file_path = filename
 
                 # switch to seed reset
-                assert isinstance(env.env.env, RobomimicImageWrapper)
+                assert isinstance(env.env.env, wrapper_factory)
                 env.env.env.init_state = None
                 env.seed(seed)
 

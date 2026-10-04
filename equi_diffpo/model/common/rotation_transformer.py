@@ -1,5 +1,10 @@
 from typing import Union
-import pytorch3d.transforms as pt
+try:
+    import pytorch3d.transforms as pt
+except ModuleNotFoundError:
+    # BIL's PyTorch version is newer than the available PyTorch3D wheels.
+    # The evaluation runner only needs axis-angle <-> matrix <-> rotation-6D.
+    from equi_diffpo.model.common import rotation_transformer_fallback as pt
 import torch
 import numpy as np
 import functools
