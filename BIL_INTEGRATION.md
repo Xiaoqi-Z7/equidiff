@@ -1,6 +1,8 @@
 # BIL checkpoints in the EquiDiff MimicGen test pipeline
 
-This checkout is pinned to EquiDiff commit `e40abb003b25071d4e5b01bfa9933dc16cd32c67`.
+This integration branch is based on upstream EquiDiff commit
+`e40abb003b25071d4e5b01bfa9933dc16cd32c67`. The parent BIL repository pins
+the exact integration commit through its `equidiff` submodule.
 The entry point directly instantiates EquiDiff's upstream
 `RobomimicImageRunner`. Its spawned vector environments, `run()` loop,
 `MultiStepWrapper`, action conversion, seeded reset protocol, maximum episode
@@ -16,6 +18,11 @@ The compatibility layer makes only the changes needed by BIL:
 - keep EquiDiff's `EnvUtils.create_env_from_metadata()` environment factory;
 - replace only the observation wrapper so BIL can read canonical object poses.
 
+The runner intentionally has no BIL-specific environment factory. This keeps
+environment construction, episode resets, vector workers, stepping, and metric
+aggregation on EquiDiff's code path; the injected wrapper only translates
+observations for BIL and leaves simulator dynamics unchanged.
+
 Both EquiDiff and BIL use MuJoCo 2.3.2 and the same robosuite commit. The
 `mujoco_py` reference in robomimic is only a stale exception-type import; it is
 not the simulation backend. The compatibility shim maps that exception to
@@ -26,6 +33,7 @@ not the simulation backend. The compatibility shim maps that exception to
 From the BIL repository root:
 
 ```bash
+git submodule update --init --recursive
 pixi install -e bil-mimicgen
 ```
 

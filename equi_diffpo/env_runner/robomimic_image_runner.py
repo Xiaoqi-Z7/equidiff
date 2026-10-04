@@ -68,7 +68,6 @@ class RobomimicImageRunner(BaseImageRunner):
             abs_action=False,
             tqdm_interval_sec=5.0,
             n_envs=None,
-            env_factory=None,
             wrapper_factory=None,
         ):
         super().__init__(output_dir)
@@ -95,13 +94,10 @@ class RobomimicImageRunner(BaseImageRunner):
             rotation_transformer = RotationTransformer('axis_angle', 'rotation_6d')
 
         def env_fn():
-            if env_factory is None:
-                robomimic_env = create_env(
-                    env_meta=env_meta,
-                    shape_meta=shape_meta,
-                )
-            else:
-                robomimic_env = env_factory(enable_render=True)
+            robomimic_env = create_env(
+                env_meta=env_meta,
+                shape_meta=shape_meta,
+            )
             # Robosuite's hard reset causes excessive memory consumption.
             # Disabled to run more envs.
             # https://github.com/ARISE-Initiative/robosuite/blob/92abf5595eddb3a845cd1093703e5a3ccd01e77e/robosuite/environments/base.py#L247-L248
@@ -135,14 +131,11 @@ class RobomimicImageRunner(BaseImageRunner):
         # a separate env_fn that does not create OpenGL context (enable_render=False)
         # is needed to initialize spaces.
         def dummy_env_fn():
-            if env_factory is None:
-                robomimic_env = create_env(
-                    env_meta=env_meta,
-                    shape_meta=shape_meta,
-                    enable_render=False,
-                )
-            else:
-                robomimic_env = env_factory(enable_render=False)
+            robomimic_env = create_env(
+                env_meta=env_meta,
+                shape_meta=shape_meta,
+                enable_render=False,
+            )
             return MultiStepWrapper(
                 VideoRecordingWrapper(
                     wrapper_factory(
