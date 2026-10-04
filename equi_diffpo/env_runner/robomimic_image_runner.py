@@ -19,9 +19,13 @@ from equi_diffpo.policy.base_image_policy import BaseImagePolicy
 from equi_diffpo.common.pytorch_util import dict_apply
 from equi_diffpo.env_runner.base_image_runner import BaseImageRunner
 from equi_diffpo.env.robomimic.robomimic_image_wrapper import RobomimicImageWrapper
-from equi_diffpo.common.mujoco_py_compat import install_mujoco_py_exception_shim
+from equi_diffpo.common.mujoco_py_compat import (
+    install_mujoco_py_exception_shim,
+    install_robosuite_egl_cleanup_shim,
+)
 
 install_mujoco_py_exception_shim()
+install_robosuite_egl_cleanup_shim()
 
 import robomimic.utils.file_utils as FileUtils
 import robomimic.utils.env_utils as EnvUtils

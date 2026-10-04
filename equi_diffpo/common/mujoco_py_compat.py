@@ -35,3 +35,40 @@ def install_mujoco_py_exception_shim() -> None:
 
         egl_probe.get_available_devices = get_available_devices
         sys.modules["egl_probe"] = egl_probe
+
+
+def install_robosuite_egl_cleanup_shim() -> None:
+    """Make robosuite's EGL context cleanup idempotent.
+
+    Robosuite registers ``eglTerminate`` with ``atexit`` while render-context
+    objects can be finalized later during interpreter shutdown.  In that
+    ordering, ``EGLGLContext.free`` sees an already terminated display and
+    raises ``EGL_NOT_INITIALIZED`` from ``__del__``.  The context cannot need
+    further destruction once its display has terminated, so clear the stale
+    handle and suppress only that cleanup-time EGL status.  Every other EGL
+    error is preserved.
+    """
+    if os.environ.get("MUJOCO_GL", "").lower() != "egl":
+        return
+
+    try:
+        from OpenGL import error as gl_error
+        from robosuite.renderers.context import egl_context
+    except ImportError:
+        return
+
+    context_class = egl_context.EGLGLContext
+    original_free = context_class.free
+    if getattr(original_free, "_bil_idempotent_cleanup", False):
+        return
+
+    def idempotent_free(self):
+        try:
+            original_free(self)
+        except gl_error.GLError as exception:
+            if getattr(exception, "err", None) != egl_context.EGL.EGL_NOT_INITIALIZED:
+                raise
+            self._context = None
+
+    idempotent_free._bil_idempotent_cleanup = True
+    context_class.free = idempotent_free

@@ -102,13 +102,16 @@ class AsyncVectorEnv(VectorEnv):
         if dummy_env_fn is None:
             dummy_env_fn = env_fns[0]
         dummy_env = dummy_env_fn()
-        self.metadata = dummy_env.metadata
-
-        if (observation_space is None) or (action_space is None):
-            observation_space = observation_space or dummy_env.observation_space
-            action_space = action_space or dummy_env.action_space
-        dummy_env.close()
-        del dummy_env
+        try:
+            self.metadata = dummy_env.metadata
+            if (observation_space is None) or (action_space is None):
+                observation_space = observation_space or dummy_env.observation_space
+                action_space = action_space or dummy_env.action_space
+        finally:
+            # The dummy environment may own a MuJoCo context even when later
+            # vector-environment initialization fails.
+            dummy_env.close()
+            del dummy_env
         super(AsyncVectorEnv, self).__init__(
             num_envs=len(env_fns),
             observation_space=observation_space,
@@ -140,33 +143,78 @@ class AsyncVectorEnv(VectorEnv):
 
         self.parent_pipes, self.processes = [], []
         self.error_queue = ctx.Queue()
+        self._state = AsyncState.DEFAULT
         target = _worker_shared_memory if self.shared_memory else _worker
         target = worker or target
-        with clear_mpi_env_vars():
-            for idx, env_fn in enumerate(self.env_fns):
-                parent_pipe, child_pipe = ctx.Pipe()
-                process = ctx.Process(
-                    target=target,
-                    name="Worker<{0}>-{1}".format(type(self).__name__, idx),
-                    args=(
-                        idx,
-                        CloudpickleWrapper(env_fn),
-                        child_pipe,
-                        parent_pipe,
-                        _obs_buffer,
-                        self.error_queue,
-                    ),
-                )
+        try:
+            with clear_mpi_env_vars():
+                for idx, env_fn in enumerate(self.env_fns):
+                    parent_pipe, child_pipe = ctx.Pipe()
+                    process = ctx.Process(
+                        target=target,
+                        name="Worker<{0}>-{1}".format(type(self).__name__, idx),
+                        args=(
+                            idx,
+                            CloudpickleWrapper(env_fn),
+                            child_pipe,
+                            parent_pipe,
+                            _obs_buffer,
+                            self.error_queue,
+                        ),
+                    )
 
-                self.parent_pipes.append(parent_pipe)
-                self.processes.append(process)
+                    self.parent_pipes.append(parent_pipe)
+                    process.daemon = daemon
+                    try:
+                        process.start()
+                    finally:
+                        child_pipe.close()
+                    self.processes.append(process)
 
-                process.daemon = daemon
-                process.start()
-                child_pipe.close()
+            self._check_observation_spaces()
+        except BaseException:
+            self._close_failed_initialization()
+            raise
 
-        self._state = AsyncState.DEFAULT
-        self._check_observation_spaces()
+    def _close_failed_initialization(self, grace_period=1.0):
+        """Best-effort cleanup when worker startup fails.
+
+        Healthy workers get a brief opportunity to close their environments
+        and EGL contexts normally.  Workers stuck in module import or already
+        disconnected are then terminated so a failed constructor cannot leak
+        processes, pipes, semaphores, or GPU contexts.
+        """
+        for pipe in self.parent_pipes:
+            if (pipe is None) or pipe.closed:
+                continue
+            try:
+                pipe.send(("close", None))
+            except (BrokenPipeError, EOFError, OSError):
+                pass
+
+        deadline = time.monotonic() + max(float(grace_period), 0.0)
+        for process in self.processes:
+            if process.pid is None:
+                continue
+            process.join(timeout=max(deadline - time.monotonic(), 0.0))
+
+        for process in self.processes:
+            if process.pid is not None and process.is_alive():
+                process.terminate()
+        for process in self.processes:
+            if process.pid is not None:
+                process.join()
+
+        for pipe in self.parent_pipes:
+            if pipe is not None and not pipe.closed:
+                pipe.close()
+
+        try:
+            self.error_queue.cancel_join_thread()
+            self.error_queue.close()
+        except (AttributeError, OSError, ValueError):
+            pass
+        self.closed = True
 
     def seed(self, seeds=None):
         self._assert_is_running()

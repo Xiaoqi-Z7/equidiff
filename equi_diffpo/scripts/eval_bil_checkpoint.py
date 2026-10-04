@@ -14,7 +14,6 @@ from equi_diffpo.env.robomimic.bil_mimicgen_wrapper import (
     BILMimicGenWrapper,
 )
 from equi_diffpo.env_runner.robomimic_image_runner import RobomimicImageRunner
-from equi_diffpo.policy.bil_checkpoint_policy import BILCheckpointPolicy
 
 
 MIMICGEN_MAX_STEPS = {
@@ -97,6 +96,14 @@ def main() -> None:
     torch.manual_seed(args.seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)
+
+    # Keep BIL's checkpoint stack out of multiprocessing spawn workers.  A
+    # spawned AsyncVectorEnv worker re-imports this entrypoint as ``__mp_main__``
+    # before it executes the worker target.  Importing the policy at module
+    # scope therefore made every environment process recursively import
+    # diffusers and transformers from the shared filesystem even though only
+    # the parent process performs policy inference.
+    from equi_diffpo.policy.bil_checkpoint_policy import BILCheckpointPolicy
 
     policy = BILCheckpointPolicy(
         checkpoint_path=args.checkpoint,

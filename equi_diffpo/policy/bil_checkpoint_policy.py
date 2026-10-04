@@ -15,12 +15,6 @@ from typing import Dict, Optional
 import torch
 import torch.nn as nn
 
-# Checkpoint factories are registered by import side effects.
-import robomimic_ext.algo  # noqa: F401
-import robomimic_ext.config  # noqa: F401
-from robomimic_ext.utils.file_utils import policy_from_checkpoint
-
-
 CALIBRATION_OBS_KEY = "bil_body_to_site_rotation"
 
 
@@ -43,6 +37,15 @@ class BILCheckpointPolicy(nn.Module):
         requested_device = torch.device(device)
         if requested_device.type == "cuda" and not torch.cuda.is_available():
             raise RuntimeError("CUDA was requested, but torch.cuda.is_available() is false")
+
+        # These imports register BIL checkpoint factories and pull in the
+        # diffusion stack.  Keep them local to construction so importing this
+        # adapter in an environment worker never imports diffusers or
+        # transformers.  Policy construction only happens in the evaluator's
+        # parent process.
+        import robomimic_ext.algo  # noqa: F401
+        import robomimic_ext.config  # noqa: F401
+        from robomimic_ext.utils.file_utils import policy_from_checkpoint
 
         rollout_policy, checkpoint = policy_from_checkpoint(
             device=requested_device,
