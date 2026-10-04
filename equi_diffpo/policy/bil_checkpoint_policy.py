@@ -122,6 +122,36 @@ class BILCheckpointPolicy(nn.Module):
     def set_normalizer(self, normalizer) -> None:
         raise RuntimeError("BIL observation normalization is stored in its checkpoint")
 
+    def set_inference_object_noise(
+        self,
+        enabled: bool,
+        position_std: Optional[float] = None,
+        position_clip: Optional[float] = None,
+        rotation_std: Optional[float] = None,
+        rotation_clip: Optional[float] = None,
+    ) -> None:
+        """Forward rollout-time object-pose noise to the BIL policy.
+
+        The underlying BIL implementation perturbs only valid entries in the
+        raw ``object`` pose observation. Robot EEF observations and actions
+        remain noise-free.
+        """
+        setter = getattr(self.bil_policy, "set_inference_object_noise", None)
+        if setter is None:
+            if enabled:
+                raise TypeError(
+                    f"Policy {type(self.bil_policy).__name__} does not support "
+                    "inference object noise"
+                )
+            return
+        setter(
+            enabled=enabled,
+            position_std=position_std,
+            position_clip=position_clip,
+            rotation_std=rotation_std,
+            rotation_clip=rotation_clip,
+        )
+
     def _prepare_obs(self, obs_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         missing = set(self.expected_obs_shapes).difference(obs_dict)
         if missing:
@@ -164,6 +194,10 @@ class BILCheckpointPolicy(nn.Module):
     @torch.inference_mode()
     def predict_action(self, obs_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         prepared = self._prepare_obs(obs_dict)
+        # Match BIL's standard rollout order: checkpoint normalization first,
+        # followed by optional inference-time object-pose noise. Keeping this
+        # policy-side leaves EquiDiff's simulator state untouched.
+        prepared = self.bil_policy._add_inference_noise_to_object(prepared)
         batch_size = next(iter(prepared.values())).shape[0]
 
         task_description = self.task_description

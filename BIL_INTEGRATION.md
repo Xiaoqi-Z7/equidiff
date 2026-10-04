@@ -68,6 +68,33 @@ By default video recording is disabled to reduce GPU and renderer memory. Use
 `--n-test-vis N` or `--n-train-vis N` to enable it for the first `N` episodes.
 Numerical results are written to `<output-dir>/metrics.json`.
 
+## Object-pose noise robustness
+
+The EquiDiff entry point can reuse BIL's rollout-time object-pose noise while
+leaving the official environment runner unchanged:
+
+```bash
+MUJOCO_GL=egl \
+PYTHONPATH="$PWD:$PWD/equidiff" \
+pixi run -e bil-mimicgen python -m equi_diffpo.scripts.eval_bil_checkpoint \
+  --checkpoint /absolute/path/to/model.pth \
+  --dataset "$PWD/data/mimicgen/square_d2.hdf5" \
+  --output-dir "$PWD/results_equidiff_bil/square_noise" \
+  --task Square_D2 \
+  --device cuda \
+  --n-train-vis 0 \
+  --n-test-vis 0 \
+  --inference-object-noise
+```
+
+Defaults match BIL's standalone evaluator: position standard deviation
+`0.005 / 2.795` m clipped to `±0.005` m, and rotation standard deviation
+`5 / 1.96` degrees clipped to `±5` degrees. The noise affects only valid
+entries in the BIL `object` observation. It does not perturb the simulator,
+robot EEF observations, or actions. Use the `--noise-position-std`,
+`--noise-position-clip`, `--noise-rotation-std`, and
+`--noise-rotation-clip` options to override it.
+
 For a language-conditioned checkpoint, pass the exact training instruction
 with `--task-description`. The adapter repeats it across the vector batch.
 

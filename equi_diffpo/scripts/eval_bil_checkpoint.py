@@ -62,6 +62,31 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--fps", type=int, default=10)
     parser.add_argument("--crf", type=int, default=22)
     parser.add_argument("--tqdm-interval-sec", type=float, default=1.0)
+    parser.add_argument(
+        "--inference-object-noise",
+        "--inference_object_noise",
+        dest="inference_object_noise",
+        action="store_true",
+        help="Add clipped Gaussian noise only to valid BIL object poses.",
+    )
+    parser.add_argument(
+        "--noise-position-std", "--noise_position_std",
+        dest="noise_position_std", type=float, default=0.005 / 2.795,
+    )
+    parser.add_argument(
+        "--noise-position-clip", "--noise_position_clip",
+        dest="noise_position_clip", type=float, default=0.005,
+    )
+    parser.add_argument(
+        "--noise-rotation-std", "--noise_rotation_std",
+        dest="noise_rotation_std", type=float, default=5.0 / 1.96,
+        help="Rotation noise standard deviation in degrees.",
+    )
+    parser.add_argument(
+        "--noise-rotation-clip", "--noise_rotation_clip",
+        dest="noise_rotation_clip", type=float, default=5.0,
+        help="Rotation noise clipping magnitude in degrees.",
+    )
     return parser
 
 
@@ -77,6 +102,13 @@ def main() -> None:
         checkpoint_path=args.checkpoint,
         device=args.device,
         task_description=args.task_description,
+    )
+    policy.set_inference_object_noise(
+        enabled=args.inference_object_noise,
+        position_std=args.noise_position_std,
+        position_clip=args.noise_position_clip,
+        rotation_std=args.noise_rotation_std,
+        rotation_clip=args.noise_rotation_clip,
     )
     task_name = args.task or policy.task_name
     if task_name is None:
@@ -112,6 +144,11 @@ def main() -> None:
                 "n_test": args.n_test,
                 "test_start_seed": args.test_start_seed,
                 "max_steps": max_steps,
+                "inference_object_noise": args.inference_object_noise,
+                "noise_position_std": args.noise_position_std,
+                "noise_position_clip": args.noise_position_clip,
+                "noise_rotation_std_degrees": args.noise_rotation_std,
+                "noise_rotation_clip_degrees": args.noise_rotation_clip,
             },
             indent=2,
         )
