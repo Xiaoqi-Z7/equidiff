@@ -154,12 +154,40 @@ class BILMimicGenWrapper(gym.Env):
     def render(self, mode="rgb_array"):
         if mode != "rgb_array":
             raise ValueError(f"Unsupported render mode {mode!r}")
-        return self.env.render(
-            mode="rgb_array",
-            height=self.render_height,
-            width=self.render_width,
-            camera_name="agentview",
-        )
+        current = self.env
+        visited = set()
+        sim = None
+        while id(current) not in visited:
+            visited.add(id(current))
+            candidate = getattr(current, "sim", None)
+            if candidate is not None:
+                sim = candidate
+                break
+            nested = getattr(current, "env", None)
+            if nested is None or nested is current:
+                break
+            current = nested
+        if sim is None:
+            raise RuntimeError("Could not locate MuJoCo simulator for rendering")
+
+        # MuJoCo 2.3 can expose both visual geoms (group 1) and the colored
+        # collision meshes (group 0) through robosuite's offscreen context.
+        # Hide only collision alpha while capturing this frame, then restore
+        # it before the next simulator step. This changes pixels only.
+        collision_ids = np.flatnonzero(np.asarray(sim.model.geom_group) == 0)
+        original_rgba = np.asarray(sim.model.geom_rgba[collision_ids]).copy()
+        try:
+            for geom_id in collision_ids:
+                sim.model.geom_rgba[geom_id, 3] = 0.0
+            return self.env.render(
+                mode="rgb_array",
+                height=self.render_height,
+                width=self.render_width,
+                camera_name="agentview",
+            )
+        finally:
+            for geom_id, rgba in zip(collision_ids, original_rgba):
+                sim.model.geom_rgba[geom_id] = rgba
 
     def close(self):
         close = getattr(self.env, "close", None)
