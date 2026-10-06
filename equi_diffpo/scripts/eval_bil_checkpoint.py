@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import random
+import re
 from pathlib import Path
 
 import numpy as np
@@ -30,6 +32,64 @@ MIMICGEN_MAX_STEPS = {
     "PickPlace_D0": 1000,
     "CoffeePreparation_D1": 800,
 }
+
+
+def organize_local_videos(log_data: dict, output_dir: Path) -> list[dict]:
+    """Give rollout videos stable seed/status names and write local manifests."""
+    pattern = re.compile(r"^(train|test)/sim_video_(-?\d+)$")
+    rows = []
+    for key, video in log_data.items():
+        match = pattern.match(key)
+        if match is None:
+            continue
+        split, seed_text = match.groups()
+        reward_key = f"{split}/sim_max_reward_{seed_text}"
+        if reward_key not in log_data:
+            raise KeyError(f"Missing reward for video {key}: {reward_key}")
+        source_value = getattr(video, "_path", None)
+        if not source_value:
+            raise ValueError(f"Video object for {key} does not expose a local path")
+        source = Path(source_value).expanduser().resolve()
+        if not source.is_file():
+            raise FileNotFoundError(f"Video for {key} not found: {source}")
+
+        reward = float(log_data[reward_key])
+        successful = reward >= 1.0 - 1e-8
+        status = "success" if successful else "failure"
+        score_suffix = "" if successful else f"_score_{reward:.3f}"
+        target = source.with_name(
+            f"{split}_seed_{seed_text}_{status}{score_suffix}{source.suffix}"
+        )
+        if source != target:
+            source.replace(target)
+            try:
+                video._path = str(target)
+            except AttributeError:
+                pass
+        rows.append({
+            "split": split,
+            "seed": int(seed_text),
+            "max_reward": reward,
+            "successful": successful,
+            "status": status,
+            "video": str(target),
+        })
+
+    rows.sort(key=lambda row: (row["split"], row["seed"]))
+    if not rows:
+        return rows
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    json_path = output_dir / "video_manifest.json"
+    json_path.write_text(json.dumps(rows, indent=2) + "\n", encoding="utf-8")
+    csv_path = output_dir / "video_manifest.csv"
+    with csv_path.open("w", newline="", encoding="utf-8") as file:
+        writer = csv.DictWriter(file, fieldnames=list(rows[0]))
+        writer.writeheader()
+        writer.writerows(rows)
+    print(f"video_manifest_json={json_path}")
+    print(f"video_manifest_csv={csv_path}")
+    return rows
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -184,6 +244,7 @@ def main() -> None:
             wrapper_factory=BILMimicGenWrapper,
         )
         log_data = runner.run(policy)
+        organize_local_videos(log_data, Path(args.output_dir).expanduser().resolve())
         metrics = {
             key: float(value)
             for key, value in log_data.items()
