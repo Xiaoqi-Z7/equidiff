@@ -9,6 +9,7 @@ checkpoint stay unchanged; observations arrive from EquiDiff with shape
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 from typing import Dict, Optional
 
@@ -21,6 +22,23 @@ CALIBRATION_OBS_KEY = "bil_body_to_site_rotation"
 def matrix_to_rotation_6d(matrix: torch.Tensor) -> torch.Tensor:
     """PyTorch3D-compatible matrix-to-6D conversion used by EquiDiff."""
     return matrix[..., :2, :].clone().reshape(*matrix.shape[:-2], 6)
+
+
+def quaternion_multiply_xyzw(
+    left: torch.Tensor, right: torch.Tensor
+) -> torch.Tensor:
+    """Hamilton product for quaternions stored in robosuite ``xyzw`` order."""
+    left_xyz, left_w = left[..., :3], left[..., 3:4]
+    right_xyz, right_w = right[..., :3], right[..., 3:4]
+    left_xyz, right_xyz = torch.broadcast_tensors(left_xyz, right_xyz)
+    left_w, right_w = torch.broadcast_tensors(left_w, right_w)
+    xyz = (
+        left_w * right_xyz
+        + right_w * left_xyz
+        + torch.linalg.cross(left_xyz, right_xyz, dim=-1)
+    )
+    w = left_w * right_w - (left_xyz * right_xyz).sum(dim=-1, keepdim=True)
+    return torch.cat((xyz, w), dim=-1)
 
 
 class BILCheckpointPolicy(nn.Module):
@@ -58,6 +76,9 @@ class BILCheckpointPolicy(nn.Module):
         self.checkpoint_path = checkpoint_path
         self.task_description = task_description
         self.obs_normalization_stats = rollout_policy.obs_normalization_stats
+        self.symmetry_object_index: Optional[int] = None
+        self.symmetry_axis: Optional[str] = None
+        self.symmetry_angle_degrees: Optional[float] = None
 
         if self.bil_policy.num_arms != 1:
             raise NotImplementedError(
@@ -155,6 +176,83 @@ class BILCheckpointPolicy(nn.Module):
             rotation_clip=rotation_clip,
         )
 
+    def set_object_symmetry_intervention(
+        self,
+        object_index: Optional[int],
+        axis: str = "z",
+        angle_degrees: float = 180.0,
+    ) -> None:
+        """Configure a fixed local-frame rotation of one policy object pose.
+
+        The intervention changes only the BIL ``object`` observation. For an
+        object world rotation ``R`` and local symmetry rotation ``S``, the
+        adapter presents ``R @ S`` to the policy while leaving the simulator
+        state, object position, and every other observation unchanged.
+        """
+        if object_index is None:
+            self.symmetry_object_index = None
+            self.symmetry_axis = None
+            self.symmetry_angle_degrees = None
+            return
+        if object_index < 0:
+            raise ValueError(f"object_index must be non-negative, got {object_index}")
+        if axis not in ("x", "y", "z"):
+            raise ValueError(f"axis must be one of x, y, z; got {axis!r}")
+        if not math.isfinite(angle_degrees):
+            raise ValueError(f"angle_degrees must be finite, got {angle_degrees}")
+        self.symmetry_object_index = int(object_index)
+        self.symmetry_axis = axis
+        self.symmetry_angle_degrees = float(angle_degrees)
+
+    def _apply_object_symmetry_intervention(
+        self, obs_dict: Dict[str, torch.Tensor]
+    ) -> Dict[str, torch.Tensor]:
+        object_index = getattr(self, "symmetry_object_index", None)
+        if object_index is None:
+            return obs_dict
+        if "object" not in obs_dict:
+            raise KeyError("Object symmetry intervention requires an 'object' observation")
+
+        objects = obs_dict["object"]
+        if objects.shape[-1] % 7 != 0:
+            raise ValueError(
+                f"Expected concatenated 7D object poses, got shape {objects.shape}."
+            )
+        num_objects = objects.shape[-1] // 7
+        if object_index >= num_objects:
+            raise IndexError(
+                f"Symmetry object index {object_index} is out of range for "
+                f"{num_objects} object poses"
+            )
+
+        object_poses = objects.clone().reshape(*objects.shape[:-1], num_objects, 7)
+        quaternion = object_poses[..., object_index, 3:7]
+        norm = torch.linalg.vector_norm(quaternion, dim=-1, keepdim=True)
+        valid = norm > 1e-8
+        safe_quaternion = quaternion / norm.clamp_min(1e-8)
+
+        half_angle = math.radians(self.symmetry_angle_degrees) / 2.0
+        local_rotation = torch.zeros(
+            4, device=objects.device, dtype=objects.dtype
+        )
+        local_rotation[("x", "y", "z").index(self.symmetry_axis)] = math.sin(
+            half_angle
+        )
+        local_rotation[3] = math.cos(half_angle)
+        rotated = quaternion_multiply_xyzw(safe_quaternion, local_rotation)
+        rotated = rotated / torch.linalg.vector_norm(
+            rotated, dim=-1, keepdim=True
+        ).clamp_min(1e-8)
+        # Match the canonical quaternion convention used by build_obs_dict().
+        rotated = torch.where(rotated[..., 3:4] < 0, -rotated, rotated)
+        object_poses[..., object_index, 3:7] = torch.where(
+            valid, rotated, quaternion
+        )
+
+        intervened = dict(obs_dict)
+        intervened["object"] = object_poses.reshape_as(objects)
+        return intervened
+
     def _prepare_obs(self, obs_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         missing = set(self.expected_obs_shapes).difference(obs_dict)
         if missing:
@@ -182,6 +280,10 @@ class BILCheckpointPolicy(nn.Module):
             elif value.shape[0] != batch_size:
                 raise ValueError("All observation keys must share the same batch size")
             prepared[key] = value[:, -self.observation_horizon :]
+
+        # Apply the causal pose intervention in raw observation coordinates,
+        # before the checkpoint's normalization statistics.
+        prepared = self._apply_object_symmetry_intervention(prepared)
 
         if self.obs_normalization_stats is not None:
             for key, stats in self.obs_normalization_stats.items():

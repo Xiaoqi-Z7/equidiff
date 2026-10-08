@@ -95,6 +95,30 @@ robot EEF observations, or actions. Use the `--noise-position-std`,
 `--noise-position-clip`, `--noise-rotation-std`, and
 `--noise-rotation-clip` options to override it.
 
+## Fixed object-symmetry intervention
+
+The adapter can replace one object's policy-input orientation with a fixed
+local-frame rotation without changing the environment state:
+
+```bash
+MUJOCO_GL=egl \
+PYTHONPATH="$PWD:$PWD/equidiff" \
+pixi run -e bil-mimicgen python -m equi_diffpo.scripts.eval_bil_checkpoint \
+  --checkpoint /absolute/path/to/model.pth \
+  --dataset "$PWD/data/mimicgen/kitchen_d1.hdf5" \
+  --output-dir "$PWD/results_equidiff_bil/kitchen_bread_z180" \
+  --task Kitchen_D1 \
+  --symmetry-object-index 1 \
+  --symmetry-axis z \
+  --symmetry-angle-deg 180
+```
+
+For `Kitchen_D1`, object index 1 is the bread cuboid. The intervention is
+`R_world_object @ R_object_delta`, so the selected axis is object-local. It is
+applied across the complete observation horizon before checkpoint
+normalization; positions, other observations, simulator dynamics, and the
+official EquiDiff rollout pipeline are unchanged.
+
 For a language-conditioned checkpoint, pass the exact training instruction
 with `--task-description`. The adapter repeats it across the vector batch.
 

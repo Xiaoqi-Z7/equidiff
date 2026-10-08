@@ -146,6 +146,27 @@ def build_parser() -> argparse.ArgumentParser:
         dest="noise_rotation_clip", type=float, default=5.0,
         help="Rotation noise clipping magnitude in degrees.",
     )
+    parser.add_argument(
+        "--symmetry-object-index",
+        type=int,
+        default=None,
+        help=(
+            "Zero-based object-pose index to rotate only at the BIL policy "
+            "input. The simulator state remains unchanged."
+        ),
+    )
+    parser.add_argument(
+        "--symmetry-axis",
+        choices=("x", "y", "z"),
+        default="z",
+        help="Object-local rotation axis for --symmetry-object-index.",
+    )
+    parser.add_argument(
+        "--symmetry-angle-deg",
+        type=float,
+        default=180.0,
+        help="Object-local rotation angle in degrees.",
+    )
     return parser
 
 
@@ -176,6 +197,11 @@ def main() -> None:
         position_clip=args.noise_position_clip,
         rotation_std=args.noise_rotation_std,
         rotation_clip=args.noise_rotation_clip,
+    )
+    policy.set_object_symmetry_intervention(
+        object_index=args.symmetry_object_index,
+        axis=args.symmetry_axis,
+        angle_degrees=args.symmetry_angle_deg,
     )
     task_name = args.task or policy.task_name
     if task_name is None:
@@ -216,6 +242,15 @@ def main() -> None:
                 "noise_position_clip": args.noise_position_clip,
                 "noise_rotation_std_degrees": args.noise_rotation_std,
                 "noise_rotation_clip_degrees": args.noise_rotation_clip,
+                "symmetry_object_index": args.symmetry_object_index,
+                "symmetry_axis": (
+                    args.symmetry_axis
+                    if args.symmetry_object_index is not None else None
+                ),
+                "symmetry_angle_degrees": (
+                    args.symmetry_angle_deg
+                    if args.symmetry_object_index is not None else None
+                ),
             },
             indent=2,
         )
