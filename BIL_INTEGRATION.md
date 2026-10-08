@@ -87,7 +87,7 @@ pixi run -e bil-mimicgen python -m equi_diffpo.scripts.eval_bil_checkpoint \
   --inference-object-noise
 ```
 
-Defaults match BIL's standalone evaluator: position standard deviation
+The default BIL input-noise settings use position standard deviation
 `0.005 / 2.795` m clipped to `±0.005` m, and rotation standard deviation
 `5 / 1.96` degrees clipped to `±5` degrees. The noise affects only valid
 entries in the BIL `object` observation. It does not perturb the simulator,
