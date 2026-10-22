@@ -105,6 +105,24 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--task-description", default=None)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--seed", type=int, default=0, help="Policy sampling seed")
+    parser.add_argument(
+        "--num-inference-steps",
+        type=int,
+        default=None,
+        help=(
+            "Override algo.flow.num_inference_steps from the checkpoint; "
+            "must not exceed its num_training_steps."
+        ),
+    )
+    parser.add_argument(
+        "--action-horizon",
+        type=int,
+        default=None,
+        help=(
+            "Override the checkpoint action horizon so the policy replans "
+            "after this many executed actions."
+        ),
+    )
     parser.add_argument("--n-train", type=int, default=6)
     parser.add_argument("--n-train-vis", type=int, default=2)
     parser.add_argument("--train-start-idx", type=int, default=0)
@@ -169,6 +187,8 @@ def main() -> None:
         checkpoint_path=args.checkpoint,
         device=args.device,
         task_description=args.task_description,
+        num_inference_steps=args.num_inference_steps,
+        action_horizon=args.action_horizon,
     )
     policy.set_inference_object_noise(
         enabled=args.inference_object_noise,
@@ -206,7 +226,13 @@ def main() -> None:
                 "device": str(policy.device),
                 "To": policy.observation_horizon,
                 "Ta": policy.action_horizon,
+                "checkpoint_Ta": policy.checkpoint_action_horizon,
                 "Tp": policy.prediction_horizon,
+                "num_training_steps": policy.num_training_steps,
+                "checkpoint_num_inference_steps": (
+                    policy.checkpoint_num_inference_steps
+                ),
+                "num_inference_steps": policy.num_inference_steps,
                 "n_envs": args.n_envs,
                 "n_test": args.n_test,
                 "test_start_seed": args.test_start_seed,

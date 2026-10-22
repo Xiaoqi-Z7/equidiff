@@ -8,6 +8,7 @@ checkpoint stay unchanged; observations arrive from EquiDiff with shape
 
 from __future__ import annotations
 
+import copy
 import json
 from pathlib import Path
 from typing import Dict, Optional
@@ -23,6 +24,117 @@ def matrix_to_rotation_6d(matrix: torch.Tensor) -> torch.Tensor:
     return matrix[..., :2, :].clone().reshape(*matrix.shape[:-2], 6)
 
 
+def checkpoint_with_inference_steps(
+    checkpoint: dict,
+    num_inference_steps: Optional[int],
+) -> tuple[dict, int, int, int]:
+    """Return a checkpoint copy with an optional inference-step override.
+
+    The flow schedule is constructed while the policy is restored, so the
+    checkpoint config must be changed before ``algo_factory`` runs.  The
+    original checkpoint object is never mutated.
+    """
+    stored_config = checkpoint.get("config")
+    if isinstance(stored_config, str):
+        config = json.loads(stored_config)
+    elif isinstance(stored_config, dict):
+        config = copy.deepcopy(stored_config)
+    else:
+        raise TypeError(
+            "Checkpoint config must be a JSON string or dictionary, got "
+            f"{type(stored_config).__name__}"
+        )
+
+    try:
+        flow_config = config["algo"]["flow"]
+        num_training_steps = int(flow_config["num_training_steps"])
+        checkpoint_num_inference_steps = int(
+            flow_config["num_inference_steps"]
+        )
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError(
+            "Checkpoint does not contain valid algo.flow training and "
+            "inference step counts"
+        ) from error
+
+    effective_num_inference_steps = (
+        checkpoint_num_inference_steps
+        if num_inference_steps is None
+        else int(num_inference_steps)
+    )
+    if not 1 <= effective_num_inference_steps <= num_training_steps:
+        raise ValueError(
+            "num_inference_steps must satisfy 1 <= steps <= "
+            f"num_training_steps ({num_training_steps}), got "
+            f"{effective_num_inference_steps}"
+        )
+
+    checkpoint_copy = dict(checkpoint)
+    if num_inference_steps is not None:
+        flow_config["num_inference_steps"] = effective_num_inference_steps
+        checkpoint_copy["config"] = (
+            json.dumps(config) if isinstance(stored_config, str) else config
+        )
+    return (
+        checkpoint_copy,
+        checkpoint_num_inference_steps,
+        effective_num_inference_steps,
+        num_training_steps,
+    )
+
+
+def checkpoint_with_action_horizon(
+    checkpoint: dict,
+    action_horizon: Optional[int],
+) -> tuple[dict, int, int, int]:
+    """Return a checkpoint copy with an optional rollout action horizon."""
+    stored_config = checkpoint.get("config")
+    if isinstance(stored_config, str):
+        config = json.loads(stored_config)
+    elif isinstance(stored_config, dict):
+        config = copy.deepcopy(stored_config)
+    else:
+        raise TypeError(
+            "Checkpoint config must be a JSON string or dictionary, got "
+            f"{type(stored_config).__name__}"
+        )
+
+    try:
+        horizon_config = config["algo"]["horizon"]
+        prediction_horizon = int(horizon_config["prediction_horizon"])
+        checkpoint_action_horizon = int(horizon_config["action_horizon"])
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError(
+            "Checkpoint does not contain valid algo.horizon prediction and "
+            "action horizons"
+        ) from error
+
+    effective_action_horizon = (
+        checkpoint_action_horizon
+        if action_horizon is None
+        else int(action_horizon)
+    )
+    if not 1 <= effective_action_horizon <= prediction_horizon:
+        raise ValueError(
+            "action_horizon must satisfy 1 <= steps <= "
+            f"prediction_horizon ({prediction_horizon}), got "
+            f"{effective_action_horizon}"
+        )
+
+    checkpoint_copy = dict(checkpoint)
+    if action_horizon is not None:
+        horizon_config["action_horizon"] = effective_action_horizon
+        checkpoint_copy["config"] = (
+            json.dumps(config) if isinstance(stored_config, str) else config
+        )
+    return (
+        checkpoint_copy,
+        checkpoint_action_horizon,
+        effective_action_horizon,
+        prediction_horizon,
+    )
+
+
 class BILCheckpointPolicy(nn.Module):
     """Expose a BIL checkpoint through EquiDiff's ``predict_action`` API."""
 
@@ -31,6 +143,8 @@ class BILCheckpointPolicy(nn.Module):
         checkpoint_path: str,
         device: str | torch.device = "cuda",
         task_description: Optional[str] = None,
+        num_inference_steps: Optional[int] = None,
+        action_horizon: Optional[int] = None,
     ):
         super().__init__()
         checkpoint_path = str(Path(checkpoint_path).expanduser().resolve())
@@ -45,11 +159,31 @@ class BILCheckpointPolicy(nn.Module):
         # parent process.
         import robomimic_ext.algo  # noqa: F401
         import robomimic_ext.config  # noqa: F401
+        from robomimic.utils.file_utils import maybe_dict_from_checkpoint
         from robomimic_ext.utils.file_utils import policy_from_checkpoint
 
+        checkpoint = maybe_dict_from_checkpoint(ckpt_path=checkpoint_path)
+        (
+            checkpoint,
+            self.checkpoint_num_inference_steps,
+            self.num_inference_steps,
+            self.num_training_steps,
+        ) = checkpoint_with_inference_steps(
+            checkpoint,
+            num_inference_steps,
+        )
+        (
+            checkpoint,
+            self.checkpoint_action_horizon,
+            effective_action_horizon,
+            checkpoint_prediction_horizon,
+        ) = checkpoint_with_action_horizon(
+            checkpoint,
+            action_horizon,
+        )
         rollout_policy, checkpoint = policy_from_checkpoint(
             device=requested_device,
-            ckpt_path=checkpoint_path,
+            ckpt_dict=checkpoint,
             verbose=False,
         )
         self._rollout_policy = rollout_policy
@@ -70,6 +204,16 @@ class BILCheckpointPolicy(nn.Module):
         self.observation_horizon = int(self.bil_policy.To)
         self.action_horizon = int(self.bil_policy.Ta)
         self.prediction_horizon = int(self.bil_policy.Tp)
+        if self.action_horizon != effective_action_horizon:
+            raise RuntimeError(
+                "Loaded policy action horizon does not match the requested "
+                f"value: {self.action_horizon} != {effective_action_horizon}"
+            )
+        if self.prediction_horizon != checkpoint_prediction_horizon:
+            raise RuntimeError(
+                "Loaded policy prediction horizon changed unexpectedly: "
+                f"{self.prediction_horizon} != {checkpoint_prediction_horizon}"
+            )
         self.expected_obs_shapes = {
             key: tuple(shape)
             for key, shape in self.bil_policy.obs_shapes.items()
