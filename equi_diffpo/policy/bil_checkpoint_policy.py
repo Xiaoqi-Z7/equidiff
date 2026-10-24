@@ -145,6 +145,7 @@ class BILCheckpointPolicy(nn.Module):
         task_description: Optional[str] = None,
         num_inference_steps: Optional[int] = None,
         action_horizon: Optional[int] = None,
+        expected_prediction_target: str = "action",
     ):
         super().__init__()
         checkpoint_path = str(Path(checkpoint_path).expanduser().resolve())
@@ -192,6 +193,15 @@ class BILCheckpointPolicy(nn.Module):
         self.checkpoint_path = checkpoint_path
         self.task_description = task_description
         self.obs_normalization_stats = rollout_policy.obs_normalization_stats
+
+        self.prediction_target = str(
+            getattr(self.bil_policy, "prediction_target", "action")
+        )
+        if self.prediction_target != expected_prediction_target:
+            raise ValueError(
+                f"Checkpoint predicts {self.prediction_target!r}, expected "
+                f"{expected_prediction_target!r}: {checkpoint_path}"
+            )
 
         if self.bil_policy.num_arms != 1:
             raise NotImplementedError(
@@ -397,3 +407,93 @@ class BILCheckpointPolicy(nn.Module):
         if not torch.isfinite(action).all():
             raise RuntimeError("BIL adapter produced NaN or Inf actions")
         return {"action": action}
+
+
+class BILEEFPlanner(BILCheckpointPolicy):
+    """Load an independent future-EEF checkpoint without producing actions."""
+
+    def __init__(
+        self,
+        checkpoint_path: str,
+        device: str | torch.device = "cuda",
+        task_description: Optional[str] = None,
+        num_inference_steps: Optional[int] = None,
+        sampling_seed: int = 0,
+    ):
+        super().__init__(
+            checkpoint_path=checkpoint_path,
+            device=device,
+            task_description=task_description,
+            num_inference_steps=num_inference_steps,
+            action_horizon=None,
+            expected_prediction_target="future_eef",
+        )
+        if self.action_horizon != self.prediction_horizon:
+            raise ValueError(
+                "EEF planner checkpoint must expose its complete prediction "
+                f"horizon, got Ta={self.action_horizon}, "
+                f"Tp={self.prediction_horizon}"
+            )
+        self.sampling_seed = int(sampling_seed)
+        self._prediction_index = 0
+
+    def reset(self) -> None:
+        self._prediction_index = 0
+
+    @torch.inference_mode()
+    def predict_reference(
+        self, obs_dict: Dict[str, torch.Tensor]
+    ) -> Dict[str, torch.Tensor]:
+        """Return world-frame EEF body poses and expert-style grip commands."""
+        prepared = self._prepare_obs(obs_dict)
+        batch_size = next(iter(prepared.values())).shape[0]
+        task_description = self.task_description
+        if task_description is not None and batch_size > 1:
+            task_description = [task_description] * batch_size
+
+        cuda_devices = []
+        if self.device.type == "cuda":
+            cuda_devices = [
+                self.device.index
+                if self.device.index is not None
+                else torch.cuda.current_device()
+            ]
+        # Planner sampling must not advance ActionFlow's global RNG stream;
+        # otherwise a nominally log-only ablation would change later actions.
+        with torch.random.fork_rng(devices=cuda_devices):
+            seed = self.sampling_seed + self._prediction_index
+            torch.manual_seed(seed)
+            if self.device.type == "cuda":
+                torch.cuda.manual_seed_all(seed)
+            trajectory = self.bil_policy._get_action_trajectory(
+                obs_dict=prepared,
+                goal_dict=None,
+                task_description=task_description,
+            )
+        self._prediction_index += 1
+        result = {
+            "future_eef_pos": trajectory["act_pos"][:, 0],
+            "future_eef_rot": trajectory["act_rot"][:, 0],
+            "act_grip": trajectory["act_grip"][:, 0],
+        }
+        expected_pos = (batch_size, self.prediction_horizon, 3)
+        expected_rot = (batch_size, self.prediction_horizon, 3, 3)
+        expected_grip = (batch_size, self.prediction_horizon, 1)
+        if tuple(result["future_eef_pos"].shape) != expected_pos:
+            raise RuntimeError(
+                f"Planner positions have {tuple(result['future_eef_pos'].shape)}, "
+                f"expected {expected_pos}"
+            )
+        if tuple(result["future_eef_rot"].shape) != expected_rot:
+            raise RuntimeError(
+                f"Planner rotations have {tuple(result['future_eef_rot'].shape)}, "
+                f"expected {expected_rot}"
+            )
+        if tuple(result["act_grip"].shape) != expected_grip:
+            raise RuntimeError(
+                f"Planner gripper has {tuple(result['act_grip'].shape)}, "
+                f"expected {expected_grip}"
+            )
+        if not all(torch.isfinite(value).all() for value in result.values()):
+            raise RuntimeError("EEF planner produced NaN or Inf values")
+        return result

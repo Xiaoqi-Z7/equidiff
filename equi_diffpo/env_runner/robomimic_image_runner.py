@@ -1,4 +1,5 @@
 import os
+import json
 import wandb
 import numpy as np
 import torch
@@ -247,7 +248,7 @@ class RobomimicImageRunner(BaseImageRunner):
         for prefix in self.env_prefixs:
             self.max_rewards[prefix] = 0
 
-    def run(self, policy: BaseImagePolicy):
+    def run(self, policy: BaseImagePolicy, eef_planner=None):
         device = policy.device
         dtype = policy.dtype
         env = self.env
@@ -260,6 +261,7 @@ class RobomimicImageRunner(BaseImageRunner):
         # allocate data
         all_video_paths = [None] * n_inits
         all_rewards = [None] * n_inits
+        all_eef_deviation_records = [list() for _ in range(n_inits)]
 
         for chunk_idx in range(n_chunks):
             start = chunk_idx * n_envs
@@ -282,6 +284,11 @@ class RobomimicImageRunner(BaseImageRunner):
             obs = env.reset()
             past_action = None
             policy.reset()
+            if eef_planner is not None:
+                eef_planner.reset()
+            chunk_eef_records = [list() for _ in range(n_envs)]
+            episode_steps = [0 for _ in range(n_envs)]
+            plan_index = 0
 
             env_name = self.env_meta['env_name']
             pbar = tqdm.tqdm(total=self.max_steps, desc=f"Eval {env_name}Image {chunk_idx+1}/{n_chunks}", 
@@ -304,6 +311,11 @@ class RobomimicImageRunner(BaseImageRunner):
                 # run policy
                 with torch.no_grad():
                     action_dict = policy.predict_action(obs_dict)
+                    reference_dict = (
+                        eef_planner.predict_reference(obs_dict)
+                        if eef_planner is not None
+                        else None
+                    )
 
                 # device_transfer
                 np_action_dict = dict_apply(action_dict,
@@ -320,8 +332,73 @@ class RobomimicImageRunner(BaseImageRunner):
                     env_action = self.undo_transform_action(action)
 
                 obs, reward, done, info = env.step(env_action)
+                if reference_dict is not None:
+                    np_reference_dict = dict_apply(
+                        reference_dict,
+                        lambda x: x.detach().to('cpu').numpy(),
+                    )
+                    per_env_step_observations = env.call(
+                        'get_attr', 'last_step_observations'
+                    )
+                    for env_idx in range(this_n_active_envs):
+                        step_observations = per_env_step_observations[env_idx]
+                        num_executed = min(
+                            len(step_observations),
+                            action.shape[1],
+                            np_reference_dict['future_eef_pos'].shape[1],
+                        )
+                        for horizon_idx in range(num_executed):
+                            actual = step_observations[horizon_idx]
+                            actual_pos = np.asarray(
+                                actual['robot0_eef_pos'], dtype=np.float64
+                            )
+                            actual_quat = np.asarray(
+                                actual['robot0_eef_quat'], dtype=np.float64
+                            )
+                            # MimicGen stores quaternions in xyzw order.
+                            quat_norm = np.linalg.norm(actual_quat)
+                            if quat_norm <= 1e-12:
+                                raise ValueError("Observed EEF quaternion has zero norm")
+                            actual_quat = actual_quat / quat_norm
+                            x, y, z, w = actual_quat
+                            actual_rot = np.asarray([
+                                [1 - 2 * (y*y + z*z), 2 * (x*y - z*w), 2 * (x*z + y*w)],
+                                [2 * (x*y + z*w), 1 - 2 * (x*x + z*z), 2 * (y*z - x*w)],
+                                [2 * (x*z - y*w), 2 * (y*z + x*w), 1 - 2 * (x*x + y*y)],
+                            ])
+                            predicted_pos = np_reference_dict[
+                                'future_eef_pos'
+                            ][env_idx, horizon_idx]
+                            predicted_rot = np_reference_dict[
+                                'future_eef_rot'
+                            ][env_idx, horizon_idx]
+                            relative_rot = predicted_rot.T @ actual_rot
+                            rotation_error = float(np.arccos(np.clip(
+                                (np.trace(relative_rot) - 1.0) / 2.0,
+                                -1.0,
+                                1.0,
+                            )))
+                            chunk_eef_records[env_idx].append({
+                                'episode_step': int(episode_steps[env_idx] + horizon_idx),
+                                'plan_index': int(plan_index),
+                                'horizon_index': int(horizon_idx),
+                                'position_error_m': float(np.linalg.norm(
+                                    actual_pos - predicted_pos
+                                )),
+                                'rotation_error_rad': rotation_error,
+                                'predicted_position': predicted_pos.tolist(),
+                                'actual_position': actual_pos.tolist(),
+                                'planner_gripper_command': float(
+                                    np_reference_dict['act_grip'][env_idx, horizon_idx, 0]
+                                ),
+                                'actionflow_gripper_command': float(
+                                    action[env_idx, horizon_idx, -1]
+                                ),
+                            })
+                        episode_steps[env_idx] += num_executed
                 done = np.all(done)
                 past_action = action
+                plan_index += 1
 
                 # update pbar
                 pbar.update(action.shape[1])
@@ -330,6 +407,10 @@ class RobomimicImageRunner(BaseImageRunner):
             # collect data for this round
             all_video_paths[this_global_slice] = env.render()[this_local_slice]
             all_rewards[this_global_slice] = env.call('get_attr', 'reward')[this_local_slice]
+            for local_idx in range(this_n_active_envs):
+                all_eef_deviation_records[start + local_idx].extend(
+                    chunk_eef_records[local_idx]
+                )
         # clear out video buffer
         _ = env.reset()
         
@@ -356,6 +437,70 @@ class RobomimicImageRunner(BaseImageRunner):
             if video_path is not None:
                 sim_video = wandb.Video(video_path)
                 log_data[prefix+f'sim_video_{seed}'] = sim_video
+
+        if eef_planner is not None:
+            output_path = pathlib.Path(self.output_dir)
+            output_path.mkdir(parents=True, exist_ok=True)
+            records_path = output_path / 'eef_deviation_records.jsonl'
+            flat_records = []
+            with records_path.open('w', encoding='utf-8') as file:
+                for rollout_idx, records in enumerate(all_eef_deviation_records):
+                    reward = float(np.max(all_rewards[rollout_idx]))
+                    successful = reward >= 1.0 - 1e-8
+                    for record in records:
+                        row = {
+                            'split': self.env_prefixs[rollout_idx].rstrip('/'),
+                            'seed': int(self.env_seeds[rollout_idx]),
+                            'successful': successful,
+                            'max_reward': reward,
+                            **record,
+                        }
+                        flat_records.append(row)
+                        file.write(json.dumps(row) + '\n')
+
+            summary = {
+                'records_path': str(records_path),
+                'num_records': len(flat_records),
+                'num_episodes': n_inits,
+                'groups': {},
+            }
+            for group_name, desired_success in (
+                ('success', True), ('failure', False), ('all', None)
+            ):
+                rows = [
+                    row for row in flat_records
+                    if desired_success is None
+                    or row['successful'] is desired_success
+                ]
+                pos = np.asarray(
+                    [row['position_error_m'] for row in rows], dtype=np.float64
+                )
+                rot = np.asarray(
+                    [row['rotation_error_rad'] for row in rows], dtype=np.float64
+                )
+                summary['groups'][group_name] = {
+                    'count': int(len(rows)),
+                    'position_error_m_mean': float(pos.mean()) if len(pos) else None,
+                    'position_error_m_p50': float(np.percentile(pos, 50)) if len(pos) else None,
+                    'position_error_m_p90': float(np.percentile(pos, 90)) if len(pos) else None,
+                    'position_error_m_p95': float(np.percentile(pos, 95)) if len(pos) else None,
+                    'rotation_error_rad_mean': float(rot.mean()) if len(rot) else None,
+                    'rotation_error_rad_p50': float(np.percentile(rot, 50)) if len(rot) else None,
+                    'rotation_error_rad_p90': float(np.percentile(rot, 90)) if len(rot) else None,
+                    'rotation_error_rad_p95': float(np.percentile(rot, 95)) if len(rot) else None,
+                }
+            summary_path = output_path / 'eef_deviation_summary.json'
+            summary_path.write_text(
+                json.dumps(summary, indent=2) + '\n', encoding='utf-8'
+            )
+            log_data['eef_planner/deviation_records'] = len(flat_records)
+            if flat_records:
+                log_data['eef_planner/position_error_m_mean'] = summary[
+                    'groups'
+                ]['all']['position_error_m_mean']
+                log_data['eef_planner/rotation_error_rad_mean'] = summary[
+                    'groups'
+                ]['all']['rotation_error_rad_mean']
         
         # log aggregate metrics
         for prefix, value in max_rewards.items():

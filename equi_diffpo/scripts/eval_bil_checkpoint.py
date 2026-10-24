@@ -95,6 +95,20 @@ def organize_local_videos(log_data: dict, output_dir: Path) -> list[dict]:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint", required=True)
+    parser.add_argument(
+        "--eef-planner-checkpoint",
+        default=None,
+        help=(
+            "Optional independent prediction_target=future_eef checkpoint. "
+            "It is evaluated in log-only mode and never changes actions."
+        ),
+    )
+    parser.add_argument(
+        "--eef-planner-num-inference-steps",
+        type=int,
+        default=None,
+        help="Optional inference-step override for the EEF planner only.",
+    )
     parser.add_argument("--dataset", required=True)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument(
@@ -181,7 +195,10 @@ def main() -> None:
     # scope therefore made every environment process recursively import
     # diffusers and transformers from the shared filesystem even though only
     # the parent process performs policy inference.
-    from equi_diffpo.policy.bil_checkpoint_policy import BILCheckpointPolicy
+    from equi_diffpo.policy.bil_checkpoint_policy import (
+        BILCheckpointPolicy,
+        BILEEFPlanner,
+    )
 
     policy = BILCheckpointPolicy(
         checkpoint_path=args.checkpoint,
@@ -197,6 +214,43 @@ def main() -> None:
         rotation_std=args.noise_rotation_std,
         rotation_clip=args.noise_rotation_clip,
     )
+    eef_planner = None
+    if args.eef_planner_checkpoint is not None:
+        planner_cuda_devices = (
+            list(range(torch.cuda.device_count()))
+            if torch.device(args.device).type == "cuda"
+            else []
+        )
+        # Constructing a second torch module may initialize temporary weights.
+        # Keep that work out of ActionFlow's RNG stream as well.
+        with torch.random.fork_rng(devices=planner_cuda_devices):
+            planner_seed = args.seed + 1_000_003
+            torch.manual_seed(planner_seed)
+            if planner_cuda_devices:
+                torch.cuda.manual_seed_all(planner_seed)
+            eef_planner = BILEEFPlanner(
+                checkpoint_path=args.eef_planner_checkpoint,
+                device=args.device,
+                task_description=args.task_description,
+                num_inference_steps=args.eef_planner_num_inference_steps,
+                sampling_seed=planner_seed,
+            )
+        if eef_planner.task_name not in (None, policy.task_name):
+            raise ValueError(
+                f"Action checkpoint task is {policy.task_name!r}, but EEF "
+                f"planner task is {eef_planner.task_name!r}"
+            )
+        if eef_planner.observation_horizon != policy.observation_horizon:
+            raise ValueError(
+                "Action policy and EEF planner observation horizons differ: "
+                f"{policy.observation_horizon} != "
+                f"{eef_planner.observation_horizon}"
+            )
+        if eef_planner.expected_obs_shapes != policy.expected_obs_shapes:
+            raise ValueError(
+                "Action policy and EEF planner require different observation "
+                "keys or shapes"
+            )
     task_name = args.task or policy.task_name
     if task_name is None:
         raise ValueError("Could not infer task from checkpoint; pass --task")
@@ -242,6 +296,14 @@ def main() -> None:
                 "noise_position_clip": args.noise_position_clip,
                 "noise_rotation_std_degrees": args.noise_rotation_std,
                 "noise_rotation_clip_degrees": args.noise_rotation_clip,
+                "eef_planner_checkpoint": (
+                    None if eef_planner is None else eef_planner.checkpoint_path
+                ),
+                "eef_planner_log_only": eef_planner is not None,
+                "eef_planner_num_inference_steps": (
+                    None if eef_planner is None
+                    else eef_planner.num_inference_steps
+                ),
             },
             indent=2,
         )
@@ -269,7 +331,7 @@ def main() -> None:
             tqdm_interval_sec=args.tqdm_interval_sec,
             wrapper_factory=BILMimicGenWrapper,
         )
-        log_data = runner.run(policy)
+        log_data = runner.run(policy, eef_planner=eef_planner)
         organize_local_videos(log_data, Path(args.output_dir).expanduser().resolve())
         metrics = {
             key: float(value)

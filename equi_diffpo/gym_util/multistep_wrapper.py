@@ -85,6 +85,7 @@ class MultiStepWrapper(gym.Wrapper):
         self.reward = list()
         self.done = list()
         self.info = defaultdict(lambda : deque(maxlen=n_obs_steps+1))
+        self.last_step_observations = []
     
     def reset(self):
         """Resets the environment using kwargs."""
@@ -94,6 +95,7 @@ class MultiStepWrapper(gym.Wrapper):
         self.reward = list()
         self.done = list()
         self.info = defaultdict(lambda : deque(maxlen=self.n_obs_steps+1))
+        self.last_step_observations = []
 
         obs = self._get_obs(self.n_obs_steps)
         return obs
@@ -102,6 +104,7 @@ class MultiStepWrapper(gym.Wrapper):
         """
         actions: (n_action_steps,) + action_shape
         """
+        self.last_step_observations = []
         for act in action:
             if len(self.done) > 0 and self.done[-1]:
                 # termination
@@ -109,6 +112,7 @@ class MultiStepWrapper(gym.Wrapper):
             observation, reward, done, info = super().step(act)
 
             self.obs.append(observation)
+            self.last_step_observations.append(observation)
             self.reward.append(reward)
             if (self.max_episode_steps is not None) \
                 and (len(self.reward) >= self.max_episode_steps):
