@@ -102,11 +102,13 @@ class MultiStepWrapper(gym.Wrapper):
         """
         actions: (n_action_steps,) + action_shape
         """
+        executed_action_steps = 0
         for act in action:
             if len(self.done) > 0 and self.done[-1]:
                 # termination
                 break
             observation, reward, done, info = super().step(act)
+            executed_action_steps += 1
 
             self.obs.append(observation)
             self.reward.append(reward)
@@ -116,11 +118,14 @@ class MultiStepWrapper(gym.Wrapper):
                 done = True
             self.done.append(done)
             self._add_info(info)
+            if bool(info.get("truncate_action_chunk", False)):
+                break
 
         observation = self._get_obs(self.n_obs_steps)
         reward = aggregate(self.reward, self.reward_agg_method)
         done = aggregate(self.done, 'max')
         info = dict_take_last_n(self.info, self.n_obs_steps)
+        info["executed_action_steps"] = executed_action_steps
         return observation, reward, done, info
 
     def _get_obs(self, n_steps=1):

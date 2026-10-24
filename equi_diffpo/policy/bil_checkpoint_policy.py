@@ -396,4 +396,57 @@ class BILCheckpointPolicy(nn.Module):
             )
         if not torch.isfinite(action).all():
             raise RuntimeError("BIL adapter produced NaN or Inf actions")
-        return {"action": action}
+
+        output = {"action": action}
+        if "future_eef_pos" in trajectory or "future_eef_rot" in trajectory:
+            if "future_eef_pos" not in trajectory or "future_eef_rot" not in trajectory:
+                raise RuntimeError(
+                    "BIL trajectory must provide both future_eef_pos and "
+                    "future_eef_rot"
+                )
+            future_eef_pos = trajectory["future_eef_pos"][:, 0]
+            future_eef_rot = trajectory["future_eef_rot"][:, 0]
+            expected_pos_shape = (batch_size, self.action_horizon, 3)
+            expected_rot_shape = (batch_size, self.action_horizon, 3, 3)
+            if tuple(future_eef_pos.shape) != expected_pos_shape:
+                raise RuntimeError(
+                    "Future EEF positions have shape "
+                    f"{tuple(future_eef_pos.shape)}, expected {expected_pos_shape}"
+                )
+            if tuple(future_eef_rot.shape) != expected_rot_shape:
+                raise RuntimeError(
+                    "Future EEF rotations have shape "
+                    f"{tuple(future_eef_rot.shape)}, expected {expected_rot_shape}"
+                )
+
+            # Future EEF supervision uses BIL's observed EEF body frame. The
+            # absolute OSC controller consumes the calibrated controller-site
+            # frame, exactly like the ordinary action trajectory above.
+            future_site_rotation = torch.einsum(
+                "btij,bjk->btik", future_eef_rot, calibration
+            )
+            correction_action = torch.cat(
+                (
+                    future_eef_pos,
+                    matrix_to_rotation_6d(future_site_rotation),
+                    trajectory["act_grip"][:, 0],
+                ),
+                dim=-1,
+            )
+            if tuple(correction_action.shape) != expected_shape:
+                raise RuntimeError(
+                    "Future EEF OSC targets have shape "
+                    f"{tuple(correction_action.shape)}, expected {expected_shape}"
+                )
+            if not (
+                torch.isfinite(future_eef_pos).all()
+                and torch.isfinite(future_eef_rot).all()
+                and torch.isfinite(correction_action).all()
+            ):
+                raise RuntimeError("Future EEF prediction contains NaN or Inf")
+            output.update({
+                "future_eef_pos": future_eef_pos,
+                "future_eef_rot": future_eef_rot,
+                "eef_correction_action": correction_action,
+            })
+        return output

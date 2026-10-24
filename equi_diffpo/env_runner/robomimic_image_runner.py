@@ -73,6 +73,13 @@ class RobomimicImageRunner(BaseImageRunner):
             tqdm_interval_sec=5.0,
             n_envs=None,
             wrapper_factory=None,
+            eef_correction=False,
+            eef_correction_position_threshold_m=0.01,
+            eef_correction_rotation_threshold_deg=10.0,
+            eef_correction_max_per_chunk=1,
+            eef_replan=False,
+            eef_replan_position_threshold_m=0.01,
+            eef_replan_rotation_threshold_deg=10.0,
         ):
         super().__init__(output_dir)
 
@@ -80,6 +87,35 @@ class RobomimicImageRunner(BaseImageRunner):
             n_envs = n_train + n_test
         if wrapper_factory is None:
             wrapper_factory = RobomimicImageWrapper
+        if eef_correction and not abs_action:
+            raise ValueError("EEF correction requires absolute OSC actions")
+        if eef_correction and eef_replan:
+            raise ValueError("EEF correction and EEF replan are mutually exclusive")
+
+        wrapper_kwargs = {}
+        if eef_correction:
+            wrapper_kwargs = {
+                "eef_correction_enabled": True,
+                "eef_correction_position_threshold_m": float(
+                    eef_correction_position_threshold_m
+                ),
+                "eef_correction_rotation_threshold_deg": float(
+                    eef_correction_rotation_threshold_deg
+                ),
+                "eef_correction_max_per_chunk": int(
+                    eef_correction_max_per_chunk
+                ),
+            }
+        elif eef_replan:
+            wrapper_kwargs = {
+                "eef_replan_enabled": True,
+                "eef_replan_position_threshold_m": float(
+                    eef_replan_position_threshold_m
+                ),
+                "eef_replan_rotation_threshold_deg": float(
+                    eef_replan_rotation_threshold_deg
+                ),
+            }
 
         # assert n_obs_steps <= n_action_steps
         dataset_path = os.path.expanduser(dataset_path)
@@ -112,7 +148,8 @@ class RobomimicImageRunner(BaseImageRunner):
                         env=robomimic_env,
                         shape_meta=shape_meta,
                         init_state=None,
-                        render_obs_key=render_obs_key
+                        render_obs_key=render_obs_key,
+                        **wrapper_kwargs,
                     ),
                     video_recoder=VideoRecorder.create_h264(
                         fps=fps,
@@ -146,7 +183,8 @@ class RobomimicImageRunner(BaseImageRunner):
                         env=robomimic_env,
                         shape_meta=shape_meta,
                         init_state=None,
-                        render_obs_key=render_obs_key
+                        render_obs_key=render_obs_key,
+                        **wrapper_kwargs,
                     ),
                     video_recoder=VideoRecorder.create_h264(
                         fps=fps,
@@ -243,6 +281,8 @@ class RobomimicImageRunner(BaseImageRunner):
         self.rotation_transformer = rotation_transformer
         self.abs_action = abs_action
         self.tqdm_interval_sec = tqdm_interval_sec
+        self.eef_correction = bool(eef_correction)
+        self.eef_replan = bool(eef_replan)
         self.max_rewards = {}
         for prefix in self.env_prefixs:
             self.max_rewards[prefix] = 0
@@ -260,6 +300,8 @@ class RobomimicImageRunner(BaseImageRunner):
         # allocate data
         all_video_paths = [None] * n_inits
         all_rewards = [None] * n_inits
+        all_eef_correction_stats = [None] * n_inits
+        all_eef_replan_stats = [None] * n_inits
 
         for chunk_idx in range(n_chunks):
             start = chunk_idx * n_envs
@@ -319,22 +361,103 @@ class RobomimicImageRunner(BaseImageRunner):
                 if self.abs_action:
                     env_action = self.undo_transform_action(action)
 
+                if self.eef_correction or self.eef_replan:
+                    required = {
+                        "future_eef_pos",
+                        "future_eef_rot",
+                    }
+                    if self.eef_correction:
+                        required.add("eef_correction_action")
+                    missing = required.difference(np_action_dict)
+                    if missing:
+                        raise RuntimeError(
+                            "EEF correction/replan requires a joint Future EEF "
+                            f"checkpoint; missing outputs: {sorted(missing)}"
+                        )
+                    future_eef_pos = np_action_dict["future_eef_pos"]
+                    future_eef_rot = np_action_dict["future_eef_rot"]
+                    expected_pos = (n_envs, action.shape[1], 3)
+                    expected_rot = (n_envs, action.shape[1], 3, 3)
+                    if future_eef_pos.shape != expected_pos:
+                        raise RuntimeError(
+                            f"Future EEF positions have shape {future_eef_pos.shape}, "
+                            f"expected {expected_pos}"
+                        )
+                    if future_eef_rot.shape != expected_rot:
+                        raise RuntimeError(
+                            f"Future EEF rotations have shape {future_eef_rot.shape}, "
+                            f"expected {expected_rot}"
+                        )
+                    if self.eef_correction:
+                        correction_action = self.undo_transform_action(
+                            np_action_dict["eef_correction_action"]
+                        )
+                        expected_action = (n_envs, action.shape[1], 7)
+                        if correction_action.shape != expected_action:
+                            raise RuntimeError(
+                                "Correction actions have shape "
+                                f"{correction_action.shape}, expected {expected_action}"
+                            )
+                        env.call_each(
+                            "set_eef_correction_plan",
+                            args_list=[
+                                (
+                                    future_eef_pos[i],
+                                    future_eef_rot[i],
+                                    correction_action[i],
+                                )
+                                for i in range(n_envs)
+                            ],
+                        )
+                    else:
+                        env.call_each(
+                            "set_eef_replan_plan",
+                            args_list=[
+                                (future_eef_pos[i], future_eef_rot[i])
+                                for i in range(n_envs)
+                            ],
+                        )
+
                 obs, reward, done, info = env.step(env_action)
                 done = np.all(done)
                 past_action = action
 
                 # update pbar
-                pbar.update(action.shape[1])
+                executed_steps = None
+                if isinstance(info, dict):
+                    executed_steps = info.get("executed_action_steps")
+                elif isinstance(info, (list, tuple)):
+                    executed_steps = [
+                        item["executed_action_steps"]
+                        for item in info
+                        if isinstance(item, dict)
+                        and "executed_action_steps" in item
+                    ]
+                progress_steps = (
+                    action.shape[1]
+                    if executed_steps is None or len(np.atleast_1d(executed_steps)) == 0
+                    else int(np.max(executed_steps))
+                )
+                pbar.update(progress_steps)
             pbar.close()
 
             # collect data for this round
             all_video_paths[this_global_slice] = env.render()[this_local_slice]
             all_rewards[this_global_slice] = env.call('get_attr', 'reward')[this_local_slice]
+            if self.eef_correction:
+                all_eef_correction_stats[this_global_slice] = env.call(
+                    "get_attr", "eef_correction_stats"
+                )[this_local_slice]
+            if self.eef_replan:
+                all_eef_replan_stats[this_global_slice] = env.call(
+                    "get_attr", "eef_replan_stats"
+                )[this_local_slice]
         # clear out video buffer
         _ = env.reset()
         
         # log
         max_rewards = collections.defaultdict(list)
+        feedback_metrics = collections.defaultdict(list)
         log_data = dict()
         # results reported in the paper are generated using the commented out line below
         # which will only report and average metrics from first n_envs initial condition and seeds
@@ -350,6 +473,32 @@ class RobomimicImageRunner(BaseImageRunner):
             max_reward = np.max(all_rewards[i])
             max_rewards[prefix].append(max_reward)
             log_data[prefix+f'sim_max_reward_{seed}'] = max_reward
+            if self.eef_correction:
+                episode_stats = all_eef_correction_stats[i]
+                if episode_stats is None:
+                    raise RuntimeError(
+                        f"Missing EEF correction statistics for rollout {i}"
+                    )
+                for key, value in episode_stats.items():
+                    numeric_value = float(value)
+                    log_data[
+                        prefix + f"eef_correction/{key}_{seed}"
+                    ] = numeric_value
+                    feedback_metrics[(prefix, f"eef_correction/{key}")].append(
+                        numeric_value
+                    )
+            if self.eef_replan:
+                episode_stats = all_eef_replan_stats[i]
+                if episode_stats is None:
+                    raise RuntimeError(
+                        f"Missing EEF replan statistics for rollout {i}"
+                    )
+                for key, value in episode_stats.items():
+                    numeric_value = float(value)
+                    log_data[prefix + f"eef_replan/{key}_{seed}"] = numeric_value
+                    feedback_metrics[(prefix, f"eef_replan/{key}")].append(
+                        numeric_value
+                    )
 
             # visualize sim
             video_path = all_video_paths[i]
@@ -364,6 +513,9 @@ class RobomimicImageRunner(BaseImageRunner):
             log_data[name] = value
             self.max_rewards[prefix] = max(self.max_rewards[prefix], value)
             log_data[prefix+'max_score'] = self.max_rewards[prefix]
+
+        for (prefix, key), values in feedback_metrics.items():
+            log_data[prefix + key + "_mean"] = float(np.mean(values))
 
         return log_data
 

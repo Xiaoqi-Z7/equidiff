@@ -123,6 +123,39 @@ def build_parser() -> argparse.ArgumentParser:
             "after this many executed actions."
         ),
     )
+    parser.add_argument(
+        "--eef-correction",
+        action="store_true",
+        help=(
+            "After an action whose achieved EEF pose exceeds the configured "
+            "error threshold, execute one extra absolute OSC step toward the "
+            "joint model's matching Future EEF prediction."
+        ),
+    )
+    parser.add_argument(
+        "--eef-correction-position-threshold-m", type=float, default=0.01,
+    )
+    parser.add_argument(
+        "--eef-correction-rotation-threshold-deg", type=float, default=10.0,
+    )
+    parser.add_argument(
+        "--eef-correction-max-per-chunk", type=int, default=1,
+    )
+    parser.add_argument(
+        "--eef-replan",
+        action="store_true",
+        help=(
+            "When achieved EEF error exceeds a threshold, discard the rest "
+            "of the current action chunk and immediately query the policy "
+            "again. No extra OSC correction action is executed."
+        ),
+    )
+    parser.add_argument(
+        "--eef-replan-position-threshold-m", type=float, default=0.01,
+    )
+    parser.add_argument(
+        "--eef-replan-rotation-threshold-deg", type=float, default=10.0,
+    )
     parser.add_argument("--n-train", type=int, default=6)
     parser.add_argument("--n-train-vis", type=int, default=2)
     parser.add_argument("--train-start-idx", type=int, default=0)
@@ -169,6 +202,18 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_parser().parse_args()
+    if args.eef_correction_position_threshold_m < 0:
+        raise ValueError("--eef-correction-position-threshold-m must be non-negative")
+    if args.eef_correction_rotation_threshold_deg < 0:
+        raise ValueError("--eef-correction-rotation-threshold-deg must be non-negative")
+    if args.eef_correction_max_per_chunk <= 0:
+        raise ValueError("--eef-correction-max-per-chunk must be positive")
+    if args.eef_replan_position_threshold_m < 0:
+        raise ValueError("--eef-replan-position-threshold-m must be non-negative")
+    if args.eef_replan_rotation_threshold_deg < 0:
+        raise ValueError("--eef-replan-rotation-threshold-deg must be non-negative")
+    if args.eef_correction and args.eef_replan:
+        raise ValueError("--eef-correction and --eef-replan are mutually exclusive")
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -190,6 +235,13 @@ def main() -> None:
         num_inference_steps=args.num_inference_steps,
         action_horizon=args.action_horizon,
     )
+    if (args.eef_correction or args.eef_replan) and not bool(
+        getattr(policy.bil_policy, "future_eef_flow_enabled", False)
+    ):
+        raise ValueError(
+            "EEF correction/replan requires a checkpoint trained with "
+            "algo.future_eef_flow.enabled=true"
+        )
     policy.set_inference_object_noise(
         enabled=args.inference_object_noise,
         position_std=args.noise_position_std,
@@ -237,6 +289,23 @@ def main() -> None:
                 "n_test": args.n_test,
                 "test_start_seed": args.test_start_seed,
                 "max_steps": max_steps,
+                "eef_correction": args.eef_correction,
+                "eef_correction_position_threshold_m": (
+                    args.eef_correction_position_threshold_m
+                ),
+                "eef_correction_rotation_threshold_deg": (
+                    args.eef_correction_rotation_threshold_deg
+                ),
+                "eef_correction_max_per_chunk": (
+                    args.eef_correction_max_per_chunk
+                ),
+                "eef_replan": args.eef_replan,
+                "eef_replan_position_threshold_m": (
+                    args.eef_replan_position_threshold_m
+                ),
+                "eef_replan_rotation_threshold_deg": (
+                    args.eef_replan_rotation_threshold_deg
+                ),
                 "inference_object_noise": args.inference_object_noise,
                 "noise_position_std": args.noise_position_std,
                 "noise_position_clip": args.noise_position_clip,
@@ -268,6 +337,21 @@ def main() -> None:
             abs_action=True,
             tqdm_interval_sec=args.tqdm_interval_sec,
             wrapper_factory=BILMimicGenWrapper,
+            eef_correction=args.eef_correction,
+            eef_correction_position_threshold_m=(
+                args.eef_correction_position_threshold_m
+            ),
+            eef_correction_rotation_threshold_deg=(
+                args.eef_correction_rotation_threshold_deg
+            ),
+            eef_correction_max_per_chunk=args.eef_correction_max_per_chunk,
+            eef_replan=args.eef_replan,
+            eef_replan_position_threshold_m=(
+                args.eef_replan_position_threshold_m
+            ),
+            eef_replan_rotation_threshold_deg=(
+                args.eef_replan_rotation_threshold_deg
+            ),
         )
         log_data = runner.run(policy)
         organize_local_videos(log_data, Path(args.output_dir).expanduser().resolve())
