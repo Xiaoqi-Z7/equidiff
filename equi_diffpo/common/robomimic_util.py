@@ -74,6 +74,14 @@ class RobomimicAbsoluteActionConverter:
 
             # taken from robot_env.py L#454
             for idx, robot in enumerate(env.env.robots):
+                # ``reset_to`` updates MuJoCo state without invalidating the
+                # controller's cached EEF state. This is especially visible
+                # on the first sample processed by a fresh converter, where
+                # ``set_goal`` would otherwise construct the absolute goal
+                # from the environment's initialization pose. Force the
+                # controller to observe the restored expert state before
+                # asking it to generate the exact delta-action goal.
+                robot.controller.update(force=True)
                 # run controller goal generator
                 robot.control(stacked_actions[i,idx], policy_step=True)
             
