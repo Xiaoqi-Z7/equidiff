@@ -203,6 +203,13 @@ class BILCheckpointPolicy(nn.Module):
                 f"{expected_prediction_target!r}: {checkpoint_path}"
             )
 
+        self.action_type = str(getattr(self.bil_policy, "action_type", "delta"))
+        if self.action_type not in ("delta", "absolute"):
+            raise ValueError(
+                "Checkpoint has unsupported action type "
+                f"{self.action_type!r}: {checkpoint_path}"
+            )
+
         if self.bil_policy.num_arms != 1:
             raise NotImplementedError(
                 "The MimicGen EquiDiff adapter currently supports one arm; "
@@ -266,8 +273,13 @@ class BILCheckpointPolicy(nn.Module):
             key: {"shape": list(shape), "type": "low_dim"}
             for key, shape in self.expected_obs_shapes.items()
         }
-        # This value is used only by the adapter, not by the trained network.
-        obs[CALIBRATION_OBS_KEY] = {"shape": [9], "type": "low_dim"}
+        # Delta-trained BIL checkpoints predict an absolute pose expressed in
+        # robosuite's observed EEF body frame. Their EquiDiff rollout action
+        # therefore needs the measured body-to-controller-site rotation.
+        # Controller-absolute checkpoints are supervised directly with OSC
+        # site-frame goals and must not receive this transform a second time.
+        if self.action_type == "delta":
+            obs[CALIBRATION_OBS_KEY] = {"shape": [9], "type": "low_dim"}
         return {
             "action": {"shape": [10]},
             "obs": obs,
@@ -367,30 +379,37 @@ class BILCheckpointPolicy(nn.Module):
             task_description=task_description,
         )
 
-        calibration = obs_dict[CALIBRATION_OBS_KEY]
-        if not isinstance(calibration, torch.Tensor):
-            calibration = torch.as_tensor(calibration)
-        calibration = calibration.to(
-            device=self.device, dtype=trajectory["act_rot"].dtype
-        )
-        if (
-            calibration.ndim != 3
-            or calibration.shape[0] != batch_size
-            or calibration.shape[1] < 1
-            or calibration.shape[2] != 9
-        ):
-            raise ValueError(
-                "Calibration observation must have shape B x To x 9; "
-                f"got {tuple(calibration.shape)}"
+        predicted_rotation = trajectory["act_rot"][:, 0]
+        if self.action_type == "delta":
+            calibration = obs_dict[CALIBRATION_OBS_KEY]
+            if not isinstance(calibration, torch.Tensor):
+                calibration = torch.as_tensor(calibration)
+            calibration = calibration.to(
+                device=self.device, dtype=predicted_rotation.dtype
             )
-        calibration = calibration[:, -1].reshape(batch_size, 3, 3)
+            if (
+                calibration.ndim != 3
+                or calibration.shape[0] != batch_size
+                or calibration.shape[1] < 1
+                or calibration.shape[2] != 9
+            ):
+                raise ValueError(
+                    "Calibration observation must have shape B x To x 9; "
+                    f"got {tuple(calibration.shape)}"
+                )
+            calibration = calibration[:, -1].reshape(batch_size, 3, 3)
 
-        # BIL predicts the robosuite EEF body frame. Absolute OSC commands in
-        # EquiDiff control an EEF site frame, so apply the measured transform.
-        body_rotation = trajectory["act_rot"][:, 0]
-        site_rotation = torch.einsum(
-            "btij,bjk->btik", body_rotation, calibration
-        )
+            # The original delta-action training path constructs its target
+            # from the observed EEF body frame. EquiDiff's absolute OSC action
+            # controls the EEF site frame, so retain the historical calibrated
+            # conversion for these checkpoints.
+            site_rotation = torch.einsum(
+                "btij,bjk->btik", predicted_rotation, calibration
+            )
+        else:
+            # Controller-absolute labels are the OSC controller's own
+            # goal_ori matrices. They already live in the EEF site frame.
+            site_rotation = predicted_rotation
         action = torch.cat(
             (
                 trajectory["act_pos"][:, 0],
@@ -439,6 +458,54 @@ class BILEEFPlanner(BILCheckpointPolicy):
 
     def reset(self) -> None:
         self._prediction_index = 0
+
+    def reference_to_action(
+        self,
+        obs_dict: Dict[str, torch.Tensor],
+        reference_dict: Dict[str, torch.Tensor],
+    ) -> torch.Tensor:
+        """Convert predicted EEF-body poses to absolute OSC site targets.
+
+        MimicGen observations expose the EEF body orientation while
+        robosuite's OSC controller targets its EEF site. Position origins
+        coincide in the current observation/controller convention; rotation
+        requires the measured body-to-site calibration used by ActionFlow.
+        """
+        positions = reference_dict["future_eef_pos"]
+        body_rotations = reference_dict["future_eef_rot"]
+        grip = reference_dict["act_grip"]
+        calibration = obs_dict[CALIBRATION_OBS_KEY]
+        if not isinstance(calibration, torch.Tensor):
+            calibration = torch.as_tensor(calibration)
+        calibration = calibration.to(
+            device=body_rotations.device,
+            dtype=body_rotations.dtype,
+        )
+        batch_size = body_rotations.shape[0]
+        if (
+            calibration.ndim != 3
+            or calibration.shape[0] != batch_size
+            or calibration.shape[1] < 1
+            or calibration.shape[2] != 9
+        ):
+            raise ValueError(
+                "Calibration observation must have shape B x To x 9; "
+                f"got {tuple(calibration.shape)}"
+            )
+        calibration = calibration[:, -1].reshape(batch_size, 3, 3)
+        site_rotations = torch.einsum(
+            "btij,bjk->btik", body_rotations, calibration
+        )
+        action = torch.cat(
+            (positions, matrix_to_rotation_6d(site_rotations), grip), dim=-1
+        )
+        expected = (batch_size, self.prediction_horizon, 10)
+        if tuple(action.shape) != expected:
+            raise RuntimeError(
+                f"Planner OSC targets have {tuple(action.shape)}, expected "
+                f"{expected}"
+            )
+        return action
 
     @torch.inference_mode()
     def predict_reference(

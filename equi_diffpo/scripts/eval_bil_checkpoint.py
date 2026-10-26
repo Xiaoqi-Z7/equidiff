@@ -100,7 +100,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "Optional independent prediction_target=future_eef checkpoint. "
-            "It is evaluated in log-only mode and never changes actions."
+            "It is log-only unless --eef-planner-replan is enabled."
         ),
     )
     parser.add_argument(
@@ -108,6 +108,54 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help="Optional inference-step override for the EEF planner only.",
+    )
+    parser.add_argument(
+        "--eef-planner-replan",
+        action="store_true",
+        help=(
+            "Execute the action chunk one control step at a time and discard "
+            "its remainder when EEF deviation exceeds the configured threshold."
+        ),
+    )
+    parser.add_argument(
+        "--eef-replan-position-threshold-m", type=float, default=0.005,
+    )
+    parser.add_argument(
+        "--eef-replan-rotation-threshold-deg", type=float, default=5.0,
+    )
+    parser.add_argument(
+        "--eef-replan-consecutive-steps", type=int, default=2,
+    )
+    parser.add_argument(
+        "--eef-replan-max-per-episode", type=int, default=20,
+    )
+    parser.add_argument(
+        "--eef-planner-pose-servo",
+        action="store_true",
+        help=(
+            "Use planner poses as absolute OSC targets and repeat each target "
+            "until it is reached, times out, or stops making progress."
+        ),
+    )
+    parser.add_argument(
+        "--eef-servo-position-tolerance-m", type=float, default=0.002,
+    )
+    parser.add_argument(
+        "--eef-servo-rotation-tolerance-deg", type=float, default=2.0,
+    )
+    parser.add_argument(
+        "--eef-servo-max-steps-per-target", type=int, default=20,
+    )
+    parser.add_argument(
+        "--eef-servo-no-progress-steps", type=int, default=5,
+    )
+    parser.add_argument(
+        "--eef-servo-max-replans-per-episode", type=int, default=20,
+    )
+    parser.add_argument(
+        "--eef-servo-gripper-source",
+        choices=("actionflow", "planner"),
+        default="actionflow",
     )
     parser.add_argument("--dataset", required=True)
     parser.add_argument("--output-dir", required=True)
@@ -183,6 +231,37 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_parser().parse_args()
+    if args.eef_planner_replan and args.eef_planner_checkpoint is None:
+        raise ValueError(
+            "--eef-planner-replan requires --eef-planner-checkpoint"
+        )
+    if args.eef_planner_pose_servo and args.eef_planner_checkpoint is None:
+        raise ValueError(
+            "--eef-planner-pose-servo requires --eef-planner-checkpoint"
+        )
+    if args.eef_planner_replan and args.eef_planner_pose_servo:
+        raise ValueError(
+            "--eef-planner-replan and --eef-planner-pose-servo are mutually "
+            "exclusive"
+        )
+    if args.eef_replan_position_threshold_m < 0:
+        raise ValueError("EEF replan position threshold must be non-negative")
+    if args.eef_replan_rotation_threshold_deg < 0:
+        raise ValueError("EEF replan rotation threshold must be non-negative")
+    if args.eef_replan_consecutive_steps <= 0:
+        raise ValueError("EEF replan consecutive steps must be positive")
+    if args.eef_replan_max_per_episode < 0:
+        raise ValueError("EEF maximum replans must be non-negative")
+    if args.eef_servo_position_tolerance_m < 0:
+        raise ValueError("EEF servo position tolerance must be non-negative")
+    if args.eef_servo_rotation_tolerance_deg < 0:
+        raise ValueError("EEF servo rotation tolerance must be non-negative")
+    if args.eef_servo_max_steps_per_target <= 0:
+        raise ValueError("EEF servo max steps per target must be positive")
+    if args.eef_servo_no_progress_steps < 0:
+        raise ValueError("EEF servo no-progress steps must be non-negative")
+    if args.eef_servo_max_replans_per_episode < 0:
+        raise ValueError("EEF servo maximum replans must be non-negative")
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -299,7 +378,41 @@ def main() -> None:
                 "eef_planner_checkpoint": (
                     None if eef_planner is None else eef_planner.checkpoint_path
                 ),
-                "eef_planner_log_only": eef_planner is not None,
+                "eef_planner_log_only": (
+                    eef_planner is not None
+                    and not args.eef_planner_replan
+                    and not args.eef_planner_pose_servo
+                ),
+                "eef_planner_replan": args.eef_planner_replan,
+                "eef_planner_pose_servo": args.eef_planner_pose_servo,
+                "eef_replan_position_threshold_m": (
+                    args.eef_replan_position_threshold_m
+                ),
+                "eef_replan_rotation_threshold_deg": (
+                    args.eef_replan_rotation_threshold_deg
+                ),
+                "eef_replan_consecutive_steps": (
+                    args.eef_replan_consecutive_steps
+                ),
+                "eef_replan_max_per_episode": (
+                    args.eef_replan_max_per_episode
+                ),
+                "eef_servo_position_tolerance_m": (
+                    args.eef_servo_position_tolerance_m
+                ),
+                "eef_servo_rotation_tolerance_deg": (
+                    args.eef_servo_rotation_tolerance_deg
+                ),
+                "eef_servo_max_steps_per_target": (
+                    args.eef_servo_max_steps_per_target
+                ),
+                "eef_servo_no_progress_steps": (
+                    args.eef_servo_no_progress_steps
+                ),
+                "eef_servo_max_replans_per_episode": (
+                    args.eef_servo_max_replans_per_episode
+                ),
+                "eef_servo_gripper_source": args.eef_servo_gripper_source,
                 "eef_planner_num_inference_steps": (
                     None if eef_planner is None
                     else eef_planner.num_inference_steps
@@ -323,7 +436,11 @@ def main() -> None:
             test_start_seed=args.test_start_seed,
             max_steps=max_steps,
             n_obs_steps=policy.observation_horizon,
-            n_action_steps=policy.action_horizon,
+            n_action_steps=(
+                1
+                if args.eef_planner_replan or args.eef_planner_pose_servo
+                else policy.action_horizon
+            ),
             fps=args.fps,
             crf=args.crf,
             n_envs=args.n_envs,
@@ -331,7 +448,42 @@ def main() -> None:
             tqdm_interval_sec=args.tqdm_interval_sec,
             wrapper_factory=BILMimicGenWrapper,
         )
-        log_data = runner.run(policy, eef_planner=eef_planner)
+        replan_config = None
+        if args.eef_planner_replan:
+            replan_config = {
+                "position_threshold_m": args.eef_replan_position_threshold_m,
+                "rotation_threshold_rad": float(np.radians(
+                    args.eef_replan_rotation_threshold_deg
+                )),
+                "rotation_threshold_deg": (
+                    args.eef_replan_rotation_threshold_deg
+                ),
+                "consecutive_steps": args.eef_replan_consecutive_steps,
+                "max_replans_per_episode": args.eef_replan_max_per_episode,
+            }
+        planner_servo_config = None
+        if args.eef_planner_pose_servo:
+            planner_servo_config = {
+                "position_tolerance_m": args.eef_servo_position_tolerance_m,
+                "rotation_tolerance_rad": float(np.radians(
+                    args.eef_servo_rotation_tolerance_deg
+                )),
+                "rotation_tolerance_deg": (
+                    args.eef_servo_rotation_tolerance_deg
+                ),
+                "max_steps_per_target": args.eef_servo_max_steps_per_target,
+                "no_progress_steps": args.eef_servo_no_progress_steps,
+                "max_replans_per_episode": (
+                    args.eef_servo_max_replans_per_episode
+                ),
+                "gripper_source": args.eef_servo_gripper_source,
+            }
+        log_data = runner.run(
+            policy,
+            eef_planner=eef_planner,
+            eef_replan_config=replan_config,
+            planner_servo_config=planner_servo_config,
+        )
         organize_local_videos(log_data, Path(args.output_dir).expanduser().resolve())
         metrics = {
             key: float(value)
