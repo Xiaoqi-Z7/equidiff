@@ -140,6 +140,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--crf", type=int, default=22)
     parser.add_argument("--tqdm-interval-sec", type=float, default=1.0)
     parser.add_argument(
+        "--residual-checkpoint",
+        default=None,
+        help="Learned residual PPO checkpoint to apply at every control step.",
+    )
+    parser.add_argument(
+        "--zero-residual",
+        action="store_true",
+        help="Use the one-step residual runner with exact zero correction.",
+    )
+    parser.add_argument(
         "--inference-object-noise",
         "--inference_object_noise",
         dest="inference_object_noise",
@@ -169,6 +179,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_parser().parse_args()
+    if args.residual_checkpoint is not None and args.zero_residual:
+        raise ValueError("--residual-checkpoint and --zero-residual are mutually exclusive")
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -219,7 +231,10 @@ def main() -> None:
             {
                 "checkpoint": policy.checkpoint_path,
                 "runner": (
-                    "equi_diffpo.env_runner.robomimic_image_runner."
+                    "robomimic_mimicgen.residual_rl.eval_runner."
+                    "ResidualRobomimicImageRunner"
+                    if args.residual_checkpoint is not None or args.zero_residual
+                    else "equi_diffpo.env_runner.robomimic_image_runner."
                     "RobomimicImageRunner"
                 ),
                 "task": task_name,
@@ -242,6 +257,8 @@ def main() -> None:
                 "noise_position_clip": args.noise_position_clip,
                 "noise_rotation_std_degrees": args.noise_rotation_std,
                 "noise_rotation_clip_degrees": args.noise_rotation_clip,
+                "residual_checkpoint": args.residual_checkpoint,
+                "zero_residual": args.zero_residual,
             },
             indent=2,
         )
@@ -249,7 +266,15 @@ def main() -> None:
 
     runner = None
     try:
-        runner = RobomimicImageRunner(
+        residual_enabled = args.residual_checkpoint is not None or args.zero_residual
+        if residual_enabled:
+            from equi_diffpo.env.robomimic.bil_mimicgen_wrapper import (
+                BILResidualMimicGenWrapper,
+            )
+            wrapper_factory = BILResidualMimicGenWrapper
+        else:
+            wrapper_factory = BILMimicGenWrapper
+        common_runner_kwargs = dict(
             output_dir=args.output_dir,
             dataset_path=args.dataset,
             shape_meta=policy.shape_meta,
@@ -267,8 +292,21 @@ def main() -> None:
             n_envs=args.n_envs,
             abs_action=True,
             tqdm_interval_sec=args.tqdm_interval_sec,
-            wrapper_factory=BILMimicGenWrapper,
+            wrapper_factory=wrapper_factory,
         )
+        if residual_enabled:
+            from robomimic_mimicgen.residual_rl.eval_runner import (
+                ResidualRobomimicImageRunner,
+            )
+
+            runner = ResidualRobomimicImageRunner(
+                **common_runner_kwargs,
+                base_action_horizon=policy.action_horizon,
+                residual_checkpoint=args.residual_checkpoint,
+                zero_residual=args.zero_residual,
+            )
+        else:
+            runner = RobomimicImageRunner(**common_runner_kwargs)
         log_data = runner.run(policy)
         organize_local_videos(log_data, Path(args.output_dir).expanduser().resolve())
         metrics = {

@@ -25,6 +25,7 @@ class BILMimicGenWrapper(gym.Env):
     """
 
     metadata = {"render.modes": ["rgb_array"]}
+    extra_observation_shapes: dict[str, tuple[int, ...]] = {}
 
     def __init__(
         self,
@@ -62,6 +63,14 @@ class BILMimicGenWrapper(gym.Env):
                 shape=tuple(value["shape"]),
                 dtype=np.float32,
             )
+        for key, shape in self.extra_observation_shapes.items():
+            if key not in observation_spaces:
+                observation_spaces[key] = spaces.Box(
+                    low=-np.inf,
+                    high=np.inf,
+                    shape=shape,
+                    dtype=np.float32,
+                )
         self.observation_space = spaces.Dict(observation_spaces)
 
     def _body_to_site_rotation(self, raw_obs: dict) -> np.ndarray:
@@ -193,3 +202,16 @@ class BILMimicGenWrapper(gym.Env):
         close = getattr(self.env, "close", None)
         if close is not None:
             close()
+
+
+class BILResidualMimicGenWrapper(BILMimicGenWrapper):
+    """BIL wrapper with the measured velocity feedback used by residual PPO.
+
+    The extra observations are not added to ActionFlow's ``shape_meta`` and
+    therefore never enter the frozen base policy.
+    """
+
+    extra_observation_shapes = {
+        "robot0_eef_vel_lin": (3,),
+        "robot0_eef_vel_ang": (3,),
+    }
