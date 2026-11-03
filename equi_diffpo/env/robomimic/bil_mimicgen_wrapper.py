@@ -9,7 +9,10 @@ import numpy as np
 from gym import spaces
 from scipy.spatial.transform import Rotation
 
-from robomimic_mimicgen.utils.mimicgen_env import MimicGenRolloutEnv
+from robomimic_mimicgen.utils.mimicgen_env import (
+    MimicGenRolloutEnv,
+    restore_controller_after_state_restore,
+)
 from robomimic_mimicgen.utils.obs_utils import build_obs_dict
 
 
@@ -124,6 +127,15 @@ class BILMimicGenWrapper(gym.Env):
             else:
                 state = {"states": np.asarray(self.init_state).copy()}
             raw_obs = self.env.reset_to(state)
+            if not isinstance(self.env, MimicGenRolloutEnv) and "states" in state:
+                # robomimic's EnvRobosuite.reset_to only writes the flattened
+                # MuJoCo state. Without this, controller caches, the nullspace
+                # reference posture and the solver warmstart are inherited
+                # from the preceding unseeded env.reset(), so dataset-init
+                # (train/) episodes are nondeterministic and do not start
+                # under demo conditions. MimicGenRolloutEnv does this itself.
+                restore_controller_after_state_restore(self.env.env)
+                raw_obs = None
         elif self._seed is not None:
             seed = self._seed
             if seed in self.seed_state_map:
