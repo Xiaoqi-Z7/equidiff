@@ -1,4 +1,5 @@
 import os
+import functools
 import wandb
 import numpy as np
 import torch
@@ -73,6 +74,8 @@ class RobomimicImageRunner(BaseImageRunner):
             tqdm_interval_sec=5.0,
             n_envs=None,
             wrapper_factory=None,
+            wrapper_kwargs=None,
+            env_construction_seed=None,
         ):
         super().__init__(output_dir)
 
@@ -80,6 +83,9 @@ class RobomimicImageRunner(BaseImageRunner):
             n_envs = n_train + n_test
         if wrapper_factory is None:
             wrapper_factory = RobomimicImageWrapper
+        # Extra keyword arguments for the env wrapper (for example the BIL
+        # wrapper's scene tilt). Empty by default: official behavior.
+        wrapper_kwargs = dict(wrapper_kwargs or {})
 
         # assert n_obs_steps <= n_action_steps
         dataset_path = os.path.expanduser(dataset_path)
@@ -97,7 +103,17 @@ class RobomimicImageRunner(BaseImageRunner):
             env_meta['env_kwargs']['controller_configs']['control_delta'] = False
             rotation_transformer = RotationTransformer('axis_angle', 'rotation_6d')
 
-        def env_fn():
+        def env_fn(worker_index=None):
+            if env_construction_seed is not None:
+                # Some tasks (e.g. Square_D1/D2 pegs) randomize static
+                # fixtures while building the model, i.e. once per worker
+                # and outside every episode seed. Spawned workers otherwise
+                # draw that layout from fresh OS entropy, so it changes from
+                # run to run. Seeding here makes it reproducible; each worker
+                # keeps its own layout. Episode seeding is unchanged.
+                import random
+                random.seed(env_construction_seed + worker_index)
+                np.random.seed(env_construction_seed + worker_index)
             robomimic_env = create_env(
                 env_meta=env_meta,
                 shape_meta=shape_meta,
@@ -112,7 +128,8 @@ class RobomimicImageRunner(BaseImageRunner):
                         env=robomimic_env,
                         shape_meta=shape_meta,
                         init_state=None,
-                        render_obs_key=render_obs_key
+                        render_obs_key=render_obs_key,
+                        **wrapper_kwargs,
                     ),
                     video_recoder=VideoRecorder.create_h264(
                         fps=fps,
@@ -146,7 +163,8 @@ class RobomimicImageRunner(BaseImageRunner):
                         env=robomimic_env,
                         shape_meta=shape_meta,
                         init_state=None,
-                        render_obs_key=render_obs_key
+                        render_obs_key=render_obs_key,
+                        **wrapper_kwargs,
                     ),
                     video_recoder=VideoRecorder.create_h264(
                         fps=fps,
@@ -164,7 +182,14 @@ class RobomimicImageRunner(BaseImageRunner):
                 max_episode_steps=max_steps
             )
 
-        env_fns = [env_fn] * n_envs
+        if env_construction_seed is None:
+            env_fns = [env_fn] * n_envs
+        else:
+            env_construction_seed = int(env_construction_seed)
+            env_fns = [
+                functools.partial(env_fn, worker_index=index)
+                for index in range(n_envs)
+            ]
         env_seeds = list()
         env_prefixs = list()
         env_init_fn_dills = list()
