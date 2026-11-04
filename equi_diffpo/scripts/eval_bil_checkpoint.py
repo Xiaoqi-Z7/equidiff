@@ -164,6 +164,41 @@ def build_parser() -> argparse.ArgumentParser:
         dest="noise_rotation_clip", type=float, default=5.0,
         help="Rotation noise clipping magnitude in degrees.",
     )
+    parser.add_argument(
+        "--scene-tilt-degrees",
+        type=float,
+        default=0.0,
+        help=(
+            "Rigidly rotate the table and all task bodies of every evaluated "
+            "scene by this angle (E3Flow tilted-table test: 10). The robot, "
+            "cameras and gravity are unchanged; 0 keeps the official scene."
+        ),
+    )
+    parser.add_argument(
+        "--scene-tilt-axis",
+        choices=("x", "y", "z"),
+        default="y",
+        help="World axis of the scene tilt.",
+    )
+    parser.add_argument(
+        "--scene-tilt-pivot",
+        type=float,
+        nargs=3,
+        default=None,
+        metavar=("X", "Y", "Z"),
+        help="World pivot of the scene tilt (default: the task's table_offset).",
+    )
+    parser.add_argument(
+        "--env-construction-seed",
+        type=int,
+        default=None,
+        help=(
+            "Seed numpy/random in vector worker i with this value + i before "
+            "the environment is built. Makes construction-time layouts "
+            "(Square_D1/D2 pegs) reproducible across runs; episode seeds are "
+            "unchanged. Default (unset) is EquiDiff's unseeded behavior."
+        ),
+    )
     return parser
 
 
@@ -204,6 +239,22 @@ def main() -> None:
         raise ValueError(
             f"Checkpoint task is {policy.task_name!r}, but --task is {args.task!r}"
         )
+    from robomimic_mimicgen.utils.scene_tilt import (
+        normalize_scene_tilt,
+        supported_task_families,
+        task_supports_scene_tilt,
+    )
+
+    scene_tilt = normalize_scene_tilt(
+        angle_degrees=args.scene_tilt_degrees,
+        axis=args.scene_tilt_axis,
+        pivot=args.scene_tilt_pivot,
+    )
+    if scene_tilt is not None and not task_supports_scene_tilt(task_name):
+        raise ValueError(
+            f"Scene tilt is not defined for {task_name!r}; supported task "
+            f"families: {supported_task_families()}"
+        )
     max_steps = args.max_steps
     if max_steps is None:
         try:
@@ -242,6 +293,8 @@ def main() -> None:
                 "noise_position_clip": args.noise_position_clip,
                 "noise_rotation_std_degrees": args.noise_rotation_std,
                 "noise_rotation_clip_degrees": args.noise_rotation_clip,
+                "scene_tilt": scene_tilt,
+                "env_construction_seed": args.env_construction_seed,
             },
             indent=2,
         )
@@ -268,9 +321,18 @@ def main() -> None:
             abs_action=True,
             tqdm_interval_sec=args.tqdm_interval_sec,
             wrapper_factory=BILMimicGenWrapper,
+            wrapper_kwargs=(
+                None if scene_tilt is None else {"scene_tilt": scene_tilt}
+            ),
+            env_construction_seed=args.env_construction_seed,
         )
         log_data = runner.run(policy)
         organize_local_videos(log_data, Path(args.output_dir).expanduser().resolve())
+        if scene_tilt is not None:
+            # Keep metrics.json numeric (consumers iterate it as floats).
+            tilt_path = Path(args.output_dir).expanduser().resolve() / "scene_tilt.json"
+            tilt_path.parent.mkdir(parents=True, exist_ok=True)
+            tilt_path.write_text(json.dumps(scene_tilt, indent=2) + "\n")
         metrics = {
             key: float(value)
             for key, value in log_data.items()

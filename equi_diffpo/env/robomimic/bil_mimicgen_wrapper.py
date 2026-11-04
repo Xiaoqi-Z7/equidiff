@@ -14,6 +14,7 @@ from robomimic_mimicgen.utils.mimicgen_env import (
     restore_controller_after_state_restore,
 )
 from robomimic_mimicgen.utils.obs_utils import build_obs_dict
+from robomimic_mimicgen.utils.scene_tilt import SceneTilt, normalize_scene_tilt
 
 
 CALIBRATION_OBS_KEY = "bil_body_to_site_rotation"
@@ -25,9 +26,19 @@ class BILMimicGenWrapper(gym.Env):
     The reset and seed behavior follows ``RobomimicImageWrapper``.  The only
     added observation is the measured EEF-body to controller-site rotation,
     which prevents a silent 90-degree orientation-frame error.
+
+    ``scene_tilt`` (optional) evaluates the same scenes on a tilted tabletop:
+    every reset first samples or restores the standard horizontal scene and
+    then applies one world-frame rigid rotation to the table and the task
+    bodies (see ``robomimic_mimicgen.utils.scene_tilt``). The robot, cameras
+    and gravity are untouched and no random numbers are consumed, so each
+    seed keeps its standard layout.
     """
 
     metadata = {"render.modes": ["rgb_array"]}
+    # Class defaults keep instances built without __init__ (tests) untilted.
+    scene_tilt_config = None
+    _scene_tilt = None
 
     def __init__(
         self,
@@ -37,6 +48,7 @@ class BILMimicGenWrapper(gym.Env):
         render_obs_key: str = "agentview_image",
         render_height: int = 256,
         render_width: int = 256,
+        scene_tilt: Optional[dict] = None,
     ):
         super().__init__()
         self.env = env
@@ -50,6 +62,14 @@ class BILMimicGenWrapper(gym.Env):
         self.seed_state_map = {}
         self._seed = None
         self.has_reset_before = False
+        self.scene_tilt_config = (
+            None if scene_tilt is None else normalize_scene_tilt(
+                angle_degrees=scene_tilt.get("angle_degrees", 0.0),
+                axis=scene_tilt.get("axis", "y"),
+                pivot=scene_tilt.get("pivot"),
+            )
+        )
+        self._scene_tilt = None
 
         self.action_space = spaces.Box(
             low=-np.inf,
@@ -117,9 +137,31 @@ class BILMimicGenWrapper(gym.Env):
         self._seed = None if seed is None else int(seed)
         return [self._seed]
 
+    def _get_scene_tilt(self) -> Optional[SceneTilt]:
+        if self.scene_tilt_config is None:
+            return None
+        robosuite_env = self.env.env
+        if self._scene_tilt is None or self._scene_tilt.env is not robosuite_env:
+            self._scene_tilt = SceneTilt(
+                env=robosuite_env,
+                task_name=self.task_name,
+                angle_degrees=self.scene_tilt_config["angle_degrees"],
+                axis=self.scene_tilt_config["axis"],
+                pivot=self.scene_tilt_config["pivot"],
+            )
+        return self._scene_tilt
+
+    @property
+    def scene_tilt_marker(self) -> Optional[dict]:
+        tilt = self._get_scene_tilt()
+        return None if tilt is None else tilt.marker
+
     def reset(self):
+        tilt = self._get_scene_tilt()
         if self.init_state is not None:
             if not self.has_reset_before:
+                if tilt is not None:
+                    tilt.before_reset()
                 self.env.reset()
                 self.has_reset_before = True
             if isinstance(self.init_state, dict):
@@ -127,6 +169,10 @@ class BILMimicGenWrapper(gym.Env):
             else:
                 state = {"states": np.asarray(self.init_state).copy()}
             raw_obs = self.env.reset_to(state)
+            if tilt is not None:
+                # Dataset initial states are horizontal demo scenes.
+                tilt.tilt_horizontal_state()
+                raw_obs = None
             if not isinstance(self.env, MimicGenRolloutEnv) and "states" in state:
                 # robomimic's EnvRobosuite.reset_to only writes the flattened
                 # MuJoCo state. Without this, controller caches, the nullspace
@@ -142,15 +188,31 @@ class BILMimicGenWrapper(gym.Env):
                 raw_obs = self.env.reset_to(
                     {"states": np.asarray(self.seed_state_map[seed]).copy()}
                 )
+                if tilt is not None:
+                    # The cached state was recorded after tilting: its free
+                    # bodies are already rotated, only the static model
+                    # bodies have to be tilted again.
+                    tilt.restore_tilted_state()
+                    raw_obs = None
             else:
                 np.random.seed(seed)
+                if tilt is not None:
+                    tilt.before_reset()
                 raw_obs = self.env.reset()
+                if tilt is not None:
+                    tilt.tilt_horizontal_state()
+                    raw_obs = None
                 self.seed_state_map[seed] = np.asarray(
                     self.env.get_state()["states"]
                 ).copy()
             self._seed = None
         else:
+            if tilt is not None:
+                tilt.before_reset()
             raw_obs = self.env.reset()
+            if tilt is not None:
+                tilt.tilt_horizontal_state()
+                raw_obs = None
         return self.get_observation(raw_obs)
 
     def step(self, action):
