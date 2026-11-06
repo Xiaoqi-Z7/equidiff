@@ -138,6 +138,10 @@ def checkpoint_with_action_horizon(
 class BILCheckpointPolicy(nn.Module):
     """Expose a BIL checkpoint through EquiDiff's ``predict_action`` API."""
 
+    # defaults for instances built without __init__ (tests): no pre-action token
+    use_pre_action_token = False
+    _pre_action = None
+
     def __init__(
         self,
         checkpoint_path: str,
@@ -231,6 +235,14 @@ class BILCheckpointPolicy(nn.Module):
             "_device_anchor", torch.empty(0, device=requested_device), persistent=False
         )
 
+        # Previous-action token (BIL pre_action_token): the last executed target
+        # of every environment is fed to the next inference; None right after a
+        # reset (the token is masked at the first step of an episode).
+        self.use_pre_action_token = bool(
+            getattr(self.bil_policy, "use_pre_action_token", False)
+        )
+        self._pre_action = None
+
     @staticmethod
     def _infer_task_name(checkpoint: dict, config: dict) -> Optional[str]:
         env_metadata = checkpoint.get("env_metadata") or {}
@@ -264,7 +276,11 @@ class BILCheckpointPolicy(nn.Module):
         }
 
     def reset(self) -> None:
-        """The batched adapter is stateless across EquiDiff action chunks."""
+        """Start new episodes: forget the previously executed actions.
+
+        Without BIL's pre_action_token the adapter is stateless.
+        """
+        self._pre_action = None
 
     def set_normalizer(self, normalizer) -> None:
         raise RuntimeError("BIL observation normalization is stored in its checkpoint")
@@ -351,11 +367,32 @@ class BILCheckpointPolicy(nn.Module):
         if task_description is not None and batch_size > 1:
             task_description = [task_description] * batch_size
 
+        extra = {}
+        if self.use_pre_action_token:
+            if (
+                self._pre_action is not None
+                and self._pre_action["act_pos"].shape[0] != batch_size
+            ):
+                raise RuntimeError(
+                    "Batch size changed without reset(); cannot pair previous actions"
+                )
+            extra["pre_action"] = self._pre_action
         trajectory = self.bil_policy._get_action_trajectory(
             obs_dict=prepared,
             goal_dict=None,
             task_description=task_description,
+            **extra,
         )
+        if self.use_pre_action_token:
+            # EquiDiff executes all Ta actions of the chunk: the last one is the
+            # step between the two observations of the next inference (BIL body
+            # frame, world positions - the same convention as in training).
+            self._pre_action = {
+                "act_pos": trajectory["act_pos"][:, :, -1].clone(),
+                "act_rot": trajectory["act_rot"][:, :, -1].clone(),
+            }
+            if trajectory.get("act_grip") is not None:
+                self._pre_action["act_grip"] = trajectory["act_grip"][:, :, -1].clone()
 
         calibration = obs_dict[CALIBRATION_OBS_KEY]
         if not isinstance(calibration, torch.Tensor):
