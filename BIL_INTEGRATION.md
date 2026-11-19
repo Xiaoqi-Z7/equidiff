@@ -64,6 +64,16 @@ pixi run -e bil-mimicgen python -m equi_diffpo.scripts.eval_bil_checkpoint \
 runner reads `To`, `Ta`, and `Tp` from the checkpoint and rejects a horizon
 mismatch instead of silently changing evaluation behavior.
 
+Flow inference defaults to the step count stored in the BIL checkpoint. Pass
+`--num-inference-steps N` to rebuild the inference schedule with a different
+count; `N` must be positive and no larger than the checkpoint's training step
+count. The checkpoint file itself is not modified.
+
+Pass `--action-horizon N` to execute only the first `N` actions from each
+predicted trajectory before replanning. This changes the policy's effective
+`Ta` while leaving `Tp` and the checkpoint file unchanged; `N` must not exceed
+the checkpoint prediction horizon.
+
 By default video recording is disabled to reduce GPU and renderer memory. Use
 `--n-test-vis N` or `--n-train-vis N` to enable it for the first `N` episodes.
 Numerical results are written to `<output-dir>/metrics.json`.

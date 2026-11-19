@@ -105,6 +105,24 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--task-description", default=None)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--seed", type=int, default=0, help="Policy sampling seed")
+    parser.add_argument(
+        "--num-inference-steps",
+        type=int,
+        default=None,
+        help=(
+            "Override algo.flow.num_inference_steps from the checkpoint; "
+            "must not exceed its num_training_steps."
+        ),
+    )
+    parser.add_argument(
+        "--action-horizon",
+        type=int,
+        default=None,
+        help=(
+            "Override the checkpoint action horizon so the policy replans "
+            "after this many executed actions."
+        ),
+    )
     parser.add_argument("--n-train", type=int, default=6)
     parser.add_argument("--n-train-vis", type=int, default=2)
     parser.add_argument("--train-start-idx", type=int, default=0)
@@ -121,6 +139,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--fps", type=int, default=10)
     parser.add_argument("--crf", type=int, default=22)
     parser.add_argument("--tqdm-interval-sec", type=float, default=1.0)
+    parser.add_argument(
+        "--residual-checkpoint",
+        default=None,
+        help="Learned residual PPO checkpoint to apply at every control step.",
+    )
+    parser.add_argument(
+        "--zero-residual",
+        action="store_true",
+        help="Use the one-step residual runner with exact zero correction.",
+    )
     parser.add_argument(
         "--inference-object-noise",
         "--inference_object_noise",
@@ -172,6 +200,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_parser().parse_args()
+    if args.residual_checkpoint is not None and args.zero_residual:
+        raise ValueError("--residual-checkpoint and --zero-residual are mutually exclusive")
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -190,6 +220,8 @@ def main() -> None:
         checkpoint_path=args.checkpoint,
         device=args.device,
         task_description=args.task_description,
+        num_inference_steps=args.num_inference_steps,
+        action_horizon=args.action_horizon,
     )
     policy.set_inference_object_noise(
         enabled=args.inference_object_noise,
@@ -225,14 +257,23 @@ def main() -> None:
             {
                 "checkpoint": policy.checkpoint_path,
                 "runner": (
-                    "equi_diffpo.env_runner.robomimic_image_runner."
+                    "robomimic_mimicgen.residual_rl.eval_runner."
+                    "ResidualRobomimicImageRunner"
+                    if args.residual_checkpoint is not None or args.zero_residual
+                    else "equi_diffpo.env_runner.robomimic_image_runner."
                     "RobomimicImageRunner"
                 ),
                 "task": task_name,
                 "device": str(policy.device),
                 "To": policy.observation_horizon,
                 "Ta": policy.action_horizon,
+                "checkpoint_Ta": policy.checkpoint_action_horizon,
                 "Tp": policy.prediction_horizon,
+                "num_training_steps": policy.num_training_steps,
+                "checkpoint_num_inference_steps": (
+                    policy.checkpoint_num_inference_steps
+                ),
+                "num_inference_steps": policy.num_inference_steps,
                 "n_envs": args.n_envs,
                 "n_test": args.n_test,
                 "test_start_seed": args.test_start_seed,
@@ -251,6 +292,8 @@ def main() -> None:
                     args.symmetry_angle_deg
                     if args.symmetry_object_index is not None else None
                 ),
+                "residual_checkpoint": args.residual_checkpoint,
+                "zero_residual": args.zero_residual,
             },
             indent=2,
         )
@@ -258,7 +301,15 @@ def main() -> None:
 
     runner = None
     try:
-        runner = RobomimicImageRunner(
+        residual_enabled = args.residual_checkpoint is not None or args.zero_residual
+        if residual_enabled:
+            from equi_diffpo.env.robomimic.bil_mimicgen_wrapper import (
+                BILResidualMimicGenWrapper,
+            )
+            wrapper_factory = BILResidualMimicGenWrapper
+        else:
+            wrapper_factory = BILMimicGenWrapper
+        common_runner_kwargs = dict(
             output_dir=args.output_dir,
             dataset_path=args.dataset,
             shape_meta=policy.shape_meta,
@@ -276,8 +327,21 @@ def main() -> None:
             n_envs=args.n_envs,
             abs_action=True,
             tqdm_interval_sec=args.tqdm_interval_sec,
-            wrapper_factory=BILMimicGenWrapper,
+            wrapper_factory=wrapper_factory,
         )
+        if residual_enabled:
+            from robomimic_mimicgen.residual_rl.eval_runner import (
+                ResidualRobomimicImageRunner,
+            )
+
+            runner = ResidualRobomimicImageRunner(
+                **common_runner_kwargs,
+                base_action_horizon=policy.action_horizon,
+                residual_checkpoint=args.residual_checkpoint,
+                zero_residual=args.zero_residual,
+            )
+        else:
+            runner = RobomimicImageRunner(**common_runner_kwargs)
         log_data = runner.run(policy)
         organize_local_videos(log_data, Path(args.output_dir).expanduser().resolve())
         metrics = {
